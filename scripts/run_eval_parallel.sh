@@ -103,12 +103,12 @@ run_one() {
 
     # generate
     if [[ -n "$gpu_id" ]]; then
-      env CUDA_VISIBLE_DEVICES="$gpu_id" python evaluate/generate_repnoise.py \
+      env CUDA_VISIBLE_DEVICES="$gpu_id" python evaluate/evaluate.py \
         --model-path "$model_path" \
         --save-dir "$save_dir" \
         --samples "$SAMPLES"
     else
-      python evaluate/generate_repnoise.py \
+      python evaluate/evaluate.py \
         --model-path "$model_path" \
         --save-dir "$save_dir" \
         --samples "$SAMPLES"

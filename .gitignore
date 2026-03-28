@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Build / packaging
+*.egg-info/
+
+# Large local data and model artifacts
+data/
+qwen-ins/
+evaluate/saves/
+wandb/

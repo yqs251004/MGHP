@@ -11,7 +11,7 @@ python train/train_sft.py \
         --lr 1e-5 \
         --steps 200
 
-python evaluate/generate_repnoise.py \
+python evaluate/evaluate.py \
     --model-path /root/autodl-tmp/outputs/harmful_booster_reproduce_mal/final-model \
     --save-dir evaluate/saves/harmful_booster_reproduce_mal_outputs \
 # call judge

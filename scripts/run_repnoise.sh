@@ -7,7 +7,7 @@
 #     --lr 1e-5 \
 #     --alpha 0 \
 #     --beta 0
-python evaluate/generate_repnoise.py \
+python evaluate/evaluate.py \
     --model-path ./repnoise_qwen_model_sft/final-model \
     --save-dir evaluate/saves/repnoise_outputs_sft \
 # call judge
@@ -22,7 +22,7 @@ python evaluate/gpt_evaluate.py \
 #         --alpha 1 \
 #         --beta ${beta}
 #     # evaluate the model
-#     python evaluate/generate_repnoise.py \
+#     python evaluate/evaluate.py \
 #         --model-path ./repnoise_qwen_model_beta_${beta}/final-model \
 #         --save-dir evaluate/saves/repnoise_outputs_beta_${beta} \
 #     # call judge

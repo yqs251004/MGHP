@@ -2,6 +2,7 @@
 import os
 
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 from transformers import get_scheduler
 from tqdm import tqdm
@@ -18,6 +19,77 @@ try:
     import wandb
 except Exception:  # wandb is optional
     wandb = None
+
+try:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        FullStateDictConfig,
+        StateDictType,
+    )
+except Exception:
+    FSDP = None
+    FullStateDictConfig = None
+    StateDictType = None
+
+
+def unwrap_model(model):
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process():
+    return (not is_distributed()) or dist.get_rank() == 0
+
+
+def set_dataloader_epoch(dataloader, epoch):
+    sampler = getattr(dataloader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+
+def save_model_and_tokenizer(model, raw_model, tokenizer, save_path):
+    os.makedirs(save_path, exist_ok=True)
+    if FSDP is not None and isinstance(model, FSDP):
+        save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_cfg):
+            state_dict = model.state_dict()
+        if is_main_process():
+            raw_model.save_pretrained(save_path, state_dict=state_dict)
+            tokenizer.save_pretrained(save_path)
+            print(f"Model saved to {save_path}")
+        if is_distributed():
+            dist.barrier()
+        return
+
+    if is_main_process():
+        raw_model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"Model saved to {save_path}")
+    if is_distributed():
+        dist.barrier()
+
+
+def is_fsdp_model(model):
+    return FSDP is not None and isinstance(model, FSDP)
+
+
+def get_optimizer_model(model, raw_model):
+    return model if is_fsdp_model(model) else raw_model
+
+
+def get_stateless_model(model, raw_model):
+    return model if is_fsdp_model(model) else raw_model
+
+
+def reduce_loss(loss):
+    if isinstance(loss, torch.Tensor) and loss.ndim > 0:
+        return loss.mean()
+    return loss
 
 class SFTTrainer:
     def __init__(
@@ -36,7 +108,7 @@ class SFTTrainer:
         out_dir=None,
         save_steps=None,
         eval_steps=10,
-        save_checkpoint_epoch=True,
+        save_checkpoint_epoch=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -54,10 +126,13 @@ class SFTTrainer:
         self.eval_steps = eval_steps
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.raw_model = unwrap_model(self.model)
+        self.raw_model.to(self.device)
         self.model.train()
 
-        self.opt = AdamW(self.model.parameters(), lr=self.lr)
+        self.opt_model = get_optimizer_model(self.model, self.raw_model)
+        self.stateless_model = get_stateless_model(self.model, self.raw_model)
+        self.opt = AdamW(self.opt_model.parameters(), lr=self.lr)
 
         self.num_training_steps = num_training_steps
         self.epochs = epochs
@@ -89,20 +164,20 @@ class SFTTrainer:
         
     def save(self, name):
         save_path = os.path.join(self.out_dir, name)
-        os.makedirs(save_path, exist_ok=True)
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        print(f"Model saved to {save_path}")
+        save_model_and_tokenizer(self.model, self.raw_model, self.tokenizer, save_path)
 
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
-            pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")
+            set_dataloader_epoch(self.train_dataloader, epoch)
+            if self.eval_dataloader is not None:
+                set_dataloader_epoch(self.eval_dataloader, epoch)
+            pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, batch in enumerate(pbar):
                 
                 if self.eval_dataloader is not None and self.global_step % self.eval_steps == 0:
-                    eval_pbar = tqdm(self.eval_dataloader, desc="Evaluating", leave=False)
+                    eval_pbar = tqdm(self.eval_dataloader, desc="Evaluating", leave=False, disable=not is_main_process())
                     eval_avg_loss = 0.0
                     for eval_step, eval_batch in enumerate(eval_pbar):
                         eval_batch = {k: v.to(self.device) for k, v in eval_batch.items()}
@@ -159,7 +234,7 @@ class SFTTrainer:
                     return
             
             # End of epoch
-            if self.save_checkpoint_epoch:
+            if self.save_checkpoint_epoch and (epoch + 1) % self.save_checkpoint_epoch == 0:
                 self.save(f"checkpoint-epoch-{epoch+1}")
         return
 
@@ -203,10 +278,13 @@ class RepnoiseTrainer:
         self.save_steps = save_steps    
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.raw_model = unwrap_model(self.model)
+        self.raw_model.to(self.device)
         self.model.train()
 
-        self.opt = AdamW(self.model.parameters(), lr=self.lr)
+        self.opt_model = get_optimizer_model(self.model, self.raw_model)
+        self.stateless_model = get_stateless_model(self.model, self.raw_model)
+        self.opt = AdamW(self.opt_model.parameters(), lr=self.lr)
 
         self.num_training_steps = num_training_steps
         self.epochs = epochs
@@ -251,18 +329,17 @@ class RepnoiseTrainer:
 
     def save(self, name):
         save_path = os.path.join(self.out_dir, name)
-        os.makedirs(save_path, exist_ok=True)
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        print(f"Model saved to {save_path}")
+        save_model_and_tokenizer(self.model, self.raw_model, self.tokenizer, save_path)
     
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
+            set_dataloader_epoch(self.harmful_dataloader, epoch)
+            set_dataloader_epoch(self.harmless_dataloader, epoch)
             total_steps = min(len(self.harmful_dataloader), len(self.harmless_dataloader))
             epoch_iter = zip(self.harmful_dataloader, self.harmless_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, (harmful_batch, harmless_batch) in enumerate(pbar):
                 harmful_batch = {k: v.to(self.device) for k, v in harmful_batch.items()}
                 harmless_batch = {k: v.to(self.device) for k, v in harmless_batch.items()}
@@ -489,7 +566,9 @@ class SAMTrainer:
         log_steps=20,
         out_dir=None,
         save_steps=None,
+        alpha=0.8,
         rho=0.05,
+        save_checkpoint_epoch=None,
     ):
         self.model = model
         self.model_name = model_name
@@ -505,14 +584,19 @@ class SAMTrainer:
         self.out_dir = out_dir
         self.save_steps = save_steps    
         self.rho = rho
+        self.alpha = alpha
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.raw_model = unwrap_model(self.model)
+        self.raw_model.to(self.device)
         self.model.train()
 
-        self.opt = AdamW(self.model.parameters(), lr=self.lr)
+        self.opt_model = get_optimizer_model(self.model, self.raw_model)
+        self.stateless_model = get_stateless_model(self.model, self.raw_model)
+        self.opt = AdamW(self.opt_model.parameters(), lr=self.lr)
 
         self.num_training_steps = num_training_steps
         self.epochs = epochs
+        self.save_checkpoint_epoch = save_checkpoint_epoch
         if self.epochs is None:
             raise ValueError("You must specify epochs for RepnoiseTrainer.")
         if self.num_training_steps is None:
@@ -544,62 +628,61 @@ class SAMTrainer:
 
     def save(self, name):
         save_path = os.path.join(self.out_dir, name)
-        os.makedirs(save_path, exist_ok=True)
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        print(f"Model saved to {save_path}")
+        save_model_and_tokenizer(self.model, self.raw_model, self.tokenizer, save_path)
     
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
-            pbar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}")
+            set_dataloader_epoch(self.dataloader, epoch)
+            pbar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, batch in enumerate(pbar):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                # first step: get the loss and the grads
-                raw_loss = self.model(**batch).loss
-                loss = raw_loss / self.grad_accum
-                params = [p for p in self.model.parameters() if p.requires_grad]
-                grads = torch.autograd.grad(loss, params, retain_graph=False, create_graph=False, allow_unused=True)
-
-                # second step: perturb the weights
-                # first copy the original weights (only trainable params)
-                original_params = [p.detach().clone() for p in params]
+                loss_raw = reduce_loss(self.model(**batch).loss)
+                trainable_named_params = [
+                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
+                ]
+                params = [p for _, p in trainable_named_params]
+                grads = torch.autograd.grad(
+                    loss_raw,
+                    params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True,
+                )
                 with torch.no_grad():
-                    # compute global gradient norm on-device (avoid .item() sync)
                     global_norm_sq = None
                     for g in grads:
                         if g is None:
                             continue
                         g2 = (g.detach().float() ** 2).sum()
                         global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
-
-                    if global_norm_sq is not None:
+                    if global_norm_sq is None:
+                        scale = None
+                    else:
                         global_norm = torch.sqrt(global_norm_sq)
-                        if global_norm.item() != 0.0:
-                            scale = self.rho / (global_norm + 1e-12)
-                            for p, g in zip(params, grads):
-                                if g is None:
-                                    continue
-                                p.add_(g.to(dtype=p.dtype) * scale.to(dtype=p.dtype))
+                        scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
+                
+                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
+                if scale is not None:
+                    for (name, p), g in zip(trainable_named_params, grads):
+                        if g is None:
+                            continue
+                        perturb = g.detach().to(dtype=p.dtype) * scale
+                        param_and_buffer_dict[name] = p + perturb
+                loss_perturbed = reduce_loss(_functional_call(self.stateless_model, param_and_buffer_dict, (), batch).loss)
 
-                del grads
-
-                # third step: get the loss and the grads
-                raw_loss_perturbed = self.model(**batch).loss
-                loss_perturbed = raw_loss_perturbed / self.grad_accum
-                loss_perturbed.backward()
+                loss = self.alpha * (loss_perturbed - loss_raw) + loss_raw
+                loss = loss / self.grad_accum
+                loss.backward()
 
                 pbar.set_postfix(
-                    loss=f"{raw_loss.item():.4f}",
-                    ploss=f"{raw_loss_perturbed.item():.4f}",
+                    loss=f"{loss.item():.4f}",
+                    raw_loss=f"{loss_raw.item():.4f}",
+                    perturbed_loss=f"{loss_perturbed.item():.4f}",
                 )
-
-                # now restore the original weights
-                with torch.no_grad():
-                    for p, orig_p in zip(params, original_params):
-                        p.copy_(orig_p)
                 
                 if (step + 1) % self.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -610,13 +693,15 @@ class SAMTrainer:
 
                     # if self.global_step % self.log_steps == 0:
                     tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {raw_loss.item():.4f}, Perturbed: {raw_loss_perturbed.item():.4f}"
+                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss_raw.item():.4f}, Perturbed: {loss_perturbed.item():.4f}"
                     )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
                             {
-                                "loss/total": raw_loss.item(),
-                                "loss/perturbed": raw_loss_perturbed.item(),
+                                "sam_loss/total": loss.item(),
+                                "sam_loss/raw": loss_raw.item(),
+                                "sam_loss/perturbed": loss_perturbed.item(),
+                                "sam_loss/grad_norm": global_norm.item() if global_norm_sq is not None else 0.0,
                             },
                             step=self.global_step,
                         )
@@ -630,7 +715,8 @@ class SAMTrainer:
                         return
             
             # End of epoch
-            self.save(f"checkpoint-epoch-{epoch+1}")
+            if self.save_checkpoint_epoch and (epoch + 1) % self.save_checkpoint_epoch == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
         return
 
 
@@ -2322,3 +2408,135 @@ class TARTrainer(BoosterTrainer):
             # End of epoch
             self.save(f"checkpoint-epoch-{epoch+1}")
         return
+
+class AttackTrainer(SFTTrainer):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        train_dataloader,
+        eval_dataloader=None,
+        lr=1e-5,
+        num_training_steps=None,
+        epochs=None,
+        grad_accum=1,
+        max_grad_norm=1.0,
+        device=None,
+        out_dir=None,
+        save_steps=None,
+        eval_steps=10,
+        save_checkpoint_epoch=5,
+        rho=0.05,
+        alpha=0.8,
+    ):
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
+            lr=lr,
+            num_training_steps=num_training_steps,
+            epochs=epochs,
+            grad_accum=grad_accum,
+            max_grad_norm=max_grad_norm,
+            device=device,
+            log_steps=eval_steps,  # reuse eval_steps for logging
+            out_dir=out_dir,
+            save_steps=save_steps,
+            eval_steps=eval_steps,
+            save_checkpoint_epoch=save_checkpoint_epoch,
+        )
+        self.rho = rho
+        self.alpha = alpha
+        
+    def train(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+
+        for epoch in range(self.epochs):
+            set_dataloader_epoch(self.train_dataloader, epoch)
+            pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+            for step, batch in enumerate(pbar):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                loss_raw = reduce_loss(self.model(**batch).loss)
+                trainable_named_params = [
+                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
+                ]
+                params = [p for _, p in trainable_named_params]
+                grads = torch.autograd.grad(
+                    loss_raw,
+                    params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+                with torch.no_grad():
+                    global_norm_sq = None
+                    for g in grads:
+                        if g is None:
+                            continue
+                        g2 = (g.detach().float() ** 2).sum()
+                        global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
+                    if global_norm_sq is None:
+                        scale = None
+                    else:
+                        global_norm = torch.sqrt(global_norm_sq)
+                        scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
+                
+                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
+                if scale is not None:
+                    for (name, p), g in zip(trainable_named_params, grads):
+                        if g is None:
+                            continue
+                        perturb = g.detach().to(dtype=p.dtype) * scale.to(dtype=p.dtype)
+                        param_and_buffer_dict[name] = p + perturb
+                
+                loss_perturbed = reduce_loss(_functional_call(self.stateless_model, param_and_buffer_dict, (), batch).loss)
+                
+                loss = self.alpha * (loss_raw - loss_perturbed) + loss_raw
+                loss = loss / self.grad_accum
+                loss.backward()
+
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    raw_loss=f"{loss_raw.item():.4f}",
+                    perturbed_loss=f"{loss_perturbed.item():.4f}",
+                )
+
+                if (step + 1) % self.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.opt.step()
+                    self.lr_scheduler.step()
+                    self.opt.zero_grad()
+                    self.global_step += 1
+
+                    # if self.global_step % self.log_steps == 0:
+                    tqdm.write(
+                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Raw Loss: {loss_raw.item():.4f}, Perturbed Loss: {loss_perturbed.item():.4f}"
+                    )
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log(
+                            {
+                                "attack_loss/total": loss.item(),
+                                "attack_loss/raw": loss_raw.item(),
+                                "attack_loss/perturbed": loss_perturbed.item(),
+                                "attack_loss/grad_norm": global_norm.item() if global_norm_sq is not None else 0.0,
+                            },
+                            step=self.global_step,
+                        )
+
+                    if self.save_steps is not None and self.global_step % self.save_steps == 0:
+                        self.save(f"checkpoint-step-{self.global_step}")
+                    
+                    if self.global_step >= self.num_training_steps:
+                        # Save final model
+                        self.save("final-model")
+                        return
+
+            if self.save_checkpoint_epoch and (epoch + 1) % self.save_checkpoint_epoch == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
+        return
+
+                
+        
