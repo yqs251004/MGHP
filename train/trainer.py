@@ -2288,6 +2288,7 @@ class TARTrainer(BoosterTrainer):
                 # Avoid edge cases (inner_steps <= 0) and reduce device syncs.
                 inner_steps = max(1, int(self.inner_steps))
                 losses_per_step = []
+                grad_dot_products = []
                 for _inner_step in range(inner_steps):
                     unsafe_loss_for_grad = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
                     grads = torch.autograd.grad(
@@ -2306,10 +2307,20 @@ class TARTrainer(BoosterTrainer):
                         create_graph=False,
                         allow_unused=True,
                     )
+                    grad_dot = None
                     for (name, _p), g in zip(trainable_named_params, safe_grads):
                         if g is None:
                             continue
                         safe_grad_buffer[name] += g.detach()
+
+                    for g, safe_g in zip(grads, safe_grads):
+                        if g is None or safe_g is None:
+                            continue
+                        dot_term = (g.detach().float() * safe_g.detach().float()).sum()
+                        grad_dot = dot_term if grad_dot is None else (grad_dot + dot_term)
+                    grad_dot_products.append(
+                        grad_dot.detach() if grad_dot is not None else torch.tensor(float("nan"), device=self.device)
+                    )
 
                     with torch.no_grad():
                         global_norm_sq = None
@@ -2357,20 +2368,16 @@ class TARTrainer(BoosterTrainer):
                 loss = loss / self.grad_accum
                 loss.backward()
                 
-                ploss1_val = losses_per_step[0].item() if len(losses_per_step) > 0 else float("nan")
-                ploss2_val = losses_per_step[1].item() if len(losses_per_step) > 1 else float("nan")
-                ploss3_val = losses_per_step[2].item() if len(losses_per_step) > 2 else float("nan")
-                ploss4_val = losses_per_step[3].item() if len(losses_per_step) > 3 else float("nan")
-                ploss5_val = losses_per_step[4].item() if len(losses_per_step) > 4 else float("nan")
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    sloss=f"{safe_loss_raw.item():.4f}",
-                    ploss1=f"{ploss1_val:.4f}",
-                    ploss2=f"{ploss2_val:.4f}",
-                    ploss3=f"{ploss3_val:.4f}",
-                    ploss4=f"{ploss4_val:.4f}",
-                    ploss5=f"{ploss5_val:.4f}"
-                )
+                sampled_inner_steps = [idx + 1 for idx in range(len(losses_per_step)) if (idx + 1) % 5 == 0]
+                avg_grad_dot_val = torch.stack(grad_dot_products).mean().item() if grad_dot_products else float("nan")
+                postfix_dict = {
+                    "loss": f"{loss.item():.4f}",
+                    "sloss": f"{safe_loss_raw.item():.4f}",
+                }
+                for inner_step in sampled_inner_steps:
+                    postfix_dict[f"ploss{inner_step}"] = f"{losses_per_step[inner_step - 1].item():.4f}"
+                    postfix_dict[f"gdot{inner_step}"] = f"{grad_dot_products[inner_step - 1].item():.4f}"
+                pbar.set_postfix(postfix_dict)
                 
                 if (step + 1) % self.grad_accum == 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -2381,19 +2388,19 @@ class TARTrainer(BoosterTrainer):
 
                     # if self.global_step % self.log_steps == 0:
                     tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, PerturbedUnsafe: {sum(losses_per_step) / len(losses_per_step) if losses_per_step else 0.0:.4f}"
+                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, PerturbedUnsafe: {sum(losses_per_step) / len(losses_per_step) if losses_per_step else 0.0:.4f}, AvgGradDot: {avg_grad_dot_val:.4f}"
                     )
                     if wandb is not None and wandb.run is not None:
+                        log_dict = {
+                            "loss/total": loss.item() * self.grad_accum,
+                            "loss/safe": safe_loss_raw.item(),
+                            "grad_dot/safe_unsafe_avg": avg_grad_dot_val,
+                        }
+                        for inner_step in sampled_inner_steps:
+                            log_dict[f"loss/perturbed_unsafe_step{inner_step}"] = losses_per_step[inner_step - 1].item()
+                            log_dict[f"grad_dot/safe_unsafe_step{inner_step}"] = grad_dot_products[inner_step - 1].item()
                         wandb.log(
-                            {
-                                "loss/total": loss.item() * self.grad_accum,
-                                "loss/safe": safe_loss_raw.item(),
-                                "loss/perturbed_unsafe_step1": ploss1_val,
-                                "loss/perturbed_unsafe_step2": ploss2_val,
-                                "loss/perturbed_unsafe_step3": ploss3_val,
-                                "loss/perturbed_unsafe_step4": ploss4_val,
-                                "loss/perturbed_unsafe_step5": ploss5_val,
-                            },
+                            log_dict,
                             step=self.global_step,
                         )
 
