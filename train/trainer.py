@@ -2586,6 +2586,12 @@ class NPOGTrainer(BoosterTrainer):
         self.beta = beta
         self.save_epochs = save_epochs
 
+        if wandb is not None and wandb.run is not None:
+            wandb.config.update({
+                "beta": beta,
+                "rho": rho,
+            })
+
     def normalize_grads(self, grads):
         global_norm_sq = None
         for g in grads:
@@ -2613,22 +2619,24 @@ class NPOGTrainer(BoosterTrainer):
                     (name, p) for name, p in self.model.named_parameters() if p.requires_grad
                 ]
                 params = [p for _, p in trainable_named_params]
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
+                named_params = {name: p for name, p in self.model.named_parameters()}
+                named_buffers = {name: b for name, b in self.model.named_buffers()}
 
                 safe_loss_for_grad = self.model(**safe_batch).loss
                 safe_grads = torch.autograd.grad(
                     safe_loss_for_grad,
                     params,
-                    retain_graph=True,
+                    retain_graph=False,
                     create_graph=False,
                     allow_unused=True,
                 )
 
                 with torch.no_grad():
                     # Normalize the safe gradients to get the perturbation direction
-                    normalized_safe_grads, global_norm = self.normalize_grads(safe_grads)
+                    normalized_safe_grads, _ = self.normalize_grads(safe_grads)
 
-                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                param_and_buffer_dict = dict(named_params)
+                param_and_buffer_dict.update(named_buffers)
 
                 for (name, p), g in zip(trainable_named_params, normalized_safe_grads):
                     if g is None:
@@ -2637,6 +2645,7 @@ class NPOGTrainer(BoosterTrainer):
                     param_and_buffer_dict[name] = p + perturb
             
                 safe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).loss
+                del safe_loss_for_grad, safe_grads, normalized_safe_grads, param_and_buffer_dict
                 
                 # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
                 unsafe_loss_for_grad = self.model(**unsafe_batch).loss
@@ -2650,13 +2659,12 @@ class NPOGTrainer(BoosterTrainer):
 
                 with torch.no_grad():
                     # Normalize the unsafe gradients to get the perturbation direction
-                    normalized_unsafe_grads, global_norm = self.normalize_grads(unsafe_grads)
+                    normalized_unsafe_grads, _ = self.normalize_grads(unsafe_grads)
                     
 
                 # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
-
-                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                param_and_buffer_dict = dict(named_params)
+                param_and_buffer_dict.update(named_buffers)
                 
                 for (name, p), g in zip(trainable_named_params, normalized_unsafe_grads):
                     if g is None:
@@ -2666,6 +2674,7 @@ class NPOGTrainer(BoosterTrainer):
                         
                 # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
                 unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
+                del unsafe_loss_for_grad, unsafe_grads, normalized_unsafe_grads, param_and_buffer_dict, named_params, named_buffers
  
                 # Losses at the original parameters (safe for backward)
                 safe_loss_raw = self.model(**safe_batch).loss
@@ -2695,7 +2704,7 @@ class NPOGTrainer(BoosterTrainer):
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
-                    self.opt.zero_grad()
+                    self.opt.zero_grad(set_to_none=True)
                     self.global_step += 1
 
                     # if self.global_step % self.log_steps == 0:
