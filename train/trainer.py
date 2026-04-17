@@ -2545,5 +2545,188 @@ class AttackTrainer(SFTTrainer):
                 self.save(f"checkpoint-epoch-{epoch+1}")
         return
 
+class NPOGTrainer(BoosterTrainer):
+    def __init__(
+        self,
+        model,
+        model_name,
+        tokenizer,
+        harmful_dataloader=None,
+        harmless_dataloader=None,
+        lr=1e-5,
+        num_training_steps=None,
+        epochs=None,
+        grad_accum=1,
+        max_grad_norm=1.0,
+        device=None,
+        log_steps=20,
+        out_dir=None,
+        save_steps=None,
+        beta=0.8,
+        rho=0.05,
+        save_epochs=None,
+    ):
+        super().__init__(
+            model=model,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            harmful_dataloader=harmful_dataloader,
+            harmless_dataloader=harmless_dataloader,
+            lr=lr,
+            num_training_steps=num_training_steps,
+            epochs=epochs,
+            grad_accum=grad_accum,
+            max_grad_norm=max_grad_norm,
+            device=device,
+            log_steps=log_steps,
+            out_dir=out_dir,
+            save_steps=save_steps,
+            rho=rho,
+        )
+        self.beta = beta
+        self.save_epochs = save_epochs
+
+    def normalize_grads(self, grads):
+        global_norm_sq = None
+        for g in grads:
+            if g is None:
+                continue
+            g2 = (g.detach().float() ** 2).sum()
+            global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
+        if global_norm_sq is None:
+            return grads, None
+        global_norm = torch.sqrt(global_norm_sq)
+        normalized_grads = [g / (global_norm + 1e-12) if g is not None else None for g in grads]
+        return normalized_grads, global_norm
+    
+    def train(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+        for epoch in range(self.epochs):
+            total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
+            epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            for step, (unsafe_batch, safe_batch) in enumerate(pbar):
+                unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
+                safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
+
+                trainable_named_params = [
+                    (name, p) for name, p in self.model.named_parameters() if p.requires_grad
+                ]
+                params = [p for _, p in trainable_named_params]
+                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
+
+                safe_loss_for_grad = self.model(**safe_batch).loss
+                safe_grads = torch.autograd.grad(
+                    safe_loss_for_grad,
+                    params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+                with torch.no_grad():
+                    # Normalize the safe gradients to get the perturbation direction
+                    normalized_safe_grads, global_norm = self.normalize_grads(safe_grads)
+
+                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+
+                for (name, p), g in zip(trainable_named_params, normalized_safe_grads):
+                    if g is None:
+                        continue
+                    perturb = g.detach().to(dtype=p.dtype) * self.rho
+                    param_and_buffer_dict[name] = p + perturb
+            
+                safe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).loss
+                
+                # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
+                unsafe_loss_for_grad = self.model(**unsafe_batch).loss
+                unsafe_grads = torch.autograd.grad(
+                    unsafe_loss_for_grad,
+                    params,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+                with torch.no_grad():
+                    # Normalize the unsafe gradients to get the perturbation direction
+                    normalized_unsafe_grads, global_norm = self.normalize_grads(unsafe_grads)
+                    
+
+                # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
+                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
+
+                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                
+                for (name, p), g in zip(trainable_named_params, normalized_unsafe_grads):
+                    if g is None:
+                        continue
+                    perturb = g.detach().to(dtype=p.dtype) * self.rho
+                    param_and_buffer_dict[name] = p + perturb
+                        
+                # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
+                unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
+ 
+                # Losses at the original parameters (safe for backward)
+                safe_loss_raw = self.model(**safe_batch).loss
+
+                unsafe_loss_raw = self.model(**unsafe_batch).loss
+
+                # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
+                # loss = safe_loss_raw - torch.log(
+                #     (1 - self.alpha) * unsafe_loss_raw + self.alpha * unsafe_loss_perturbed
+                # )
+                # loss = safe_loss_raw + self.alpha * (unsafe_loss_raw - unsafe_loss_perturbed)
+                # loss = (1 - self.alpha) * safe_loss_raw + self.alpha * unsafe_loss_perturbed
+                loss = safe_loss_raw - torch.log(torch.sigmoid(self.beta * (torch.log(safe_loss_raw / safe_loss_perturbed) - torch.log(unsafe_loss_raw / unsafe_loss_perturbed)))) / self.beta
+                
+                loss = loss / self.grad_accum
+                loss.backward()
+                
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    sloss=f"{safe_loss_raw.item():.4f}",
+                    sploss=f"{safe_loss_perturbed.item():.4f}",
+                    hloss=f"{unsafe_loss_raw.item():.4f}",
+                    hploss=f"{unsafe_loss_perturbed.item():.4f}",
+                )
+                
+                if (step + 1) % self.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.opt.step()
+                    self.lr_scheduler.step()
+                    self.opt.zero_grad()
+                    self.global_step += 1
+
+                    # if self.global_step % self.log_steps == 0:
+                    tqdm.write(
+                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Perturbed Safe: {safe_loss_perturbed.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, Perturbed Unsafe: {unsafe_loss_perturbed.item():.4f}"
+                    )
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log(
+                            {
+                                "loss/total": loss.item() * self.grad_accum,
+                                "loss/safe": safe_loss_raw.item(),
+                                "loss/safe_perturbed": safe_loss_perturbed.item(),
+                                "loss/unsafe": unsafe_loss_raw.item(),
+                                "loss/unsafe_perturbed": unsafe_loss_perturbed.item(),
+                            },
+                            step=self.global_step,
+                        )
+
+                    if self.save_steps is not None and self.global_step % self.save_steps == 0:
+                        self.save(f"checkpoint-step-{self.global_step}")
+                    
+                    if self.global_step >= self.num_training_steps:
+                        # Save final model
+                        self.save("final-model")
+                        return
+            
+            # End of epoch
+            if self.save_epochs is not None and (epoch + 1) % self.save_epochs == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
+        return
+
+
                 
         
