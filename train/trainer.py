@@ -913,6 +913,20 @@ class BoosterTrainer(SAMTrainer):
             "constant",
             optimizer=self.opt,
         )
+        if wandb is not None and wandb.run is not None:
+            safe_bs = getattr(self.safe_dataloader, "batch_size", None)
+            unsafe_bs = getattr(self.unsafe_dataloader, "batch_size", None)
+            wandb.config.update(
+                {
+                    "lr": self.lr,
+                    "epochs": self.epochs,
+                    "num_training_steps": self.num_training_steps,  
+                    "alpha": self.alpha,
+                    "rho": self.rho,
+                    "safe_batch_size": safe_bs,
+                    "unsafe_batch_size": unsafe_bs,
+                }
+            )
     
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
@@ -2736,6 +2750,159 @@ class NPOGTrainer(BoosterTrainer):
                 self.save(f"checkpoint-epoch-{epoch+1}")
         return
 
+class PatchTrainer(SFTTrainer):
+    def __init__(
+        self,
+        model,
+        attacked_model,
+        tokenizer,
+        train_dataloader,
+        eval_dataloader=None,
+        lr=1e-5,
+        num_training_steps=None,
+        epochs=None,
+        grad_accum=1,
+        max_grad_norm=1.0,
+        device=None,
+        out_dir=None,
+        save_steps=None,
+        eval_steps=10,
+        save_checkpoint_epoch=5,
+        alpha=0.5,
+        # lambda_reg=0.01,
+    ):
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
+            lr=lr,
+            num_training_steps=num_training_steps,
+            epochs=epochs,
+            grad_accum=grad_accum,
+            max_grad_norm=max_grad_norm,
+            device=device,
+            log_steps=eval_steps,  # reuse eval_steps for logging
+            out_dir=out_dir,
+            save_steps=save_steps,
+            eval_steps=eval_steps,
+            save_checkpoint_epoch=save_checkpoint_epoch,
+        )
+        self.attacked_model = attacked_model
+        self.attacked_raw_model = unwrap_model(self.attacked_model)
+        self.attacked_raw_model.to(self.device)
+        self.attacked_model.eval()
 
-                
+        self.alpha = alpha
+        # self.lambda_reg = lambda_reg
+        # initialize patch
+        base_params = {
+            name: p.detach() for name, p in self.stateless_model.named_parameters()
+        }
+        attacked_base_params = {
+            name: p.detach()
+            for name, p in self.attacked_raw_model.named_parameters()
+        }
+        if set(base_params.keys()) != set(attacked_base_params.keys()):
+            raise ValueError("model and attacked_model must share the same parameter names for PatchTrainer.")
+
+        # calculate the attack vector 
+        self.attack_vector = {
+            name: attacked_base_params[name] - base_params[name]
+            for name in base_params.keys()
+        }
+
+    def _compose_params(self, params, stateless_model):
+        params_and_buffers = {
+            name: tensor for name, tensor in stateless_model.named_buffers()
+        }
+        for name, param in params.items():
+            params_and_buffers[name] = param + self.attack_vector[name]
+        return params_and_buffers
+
+    # def save(self, name):
+    #     save_path = os.path.join(self.out_dir, name)
+    #     os.makedirs(save_path, exist_ok=True)
+
+    #     merged_state_dict = {
+    #         key: value.detach().cpu().clone()
+    #         for key, value in self.raw_model.state_dict().items()
+    #     }
+    #     for name, base_param in self.base_params.items():
+    #         merged_state_dict[name] = (base_param + self.patch[name]).detach().cpu().clone()
+
+    #     if is_main_process():
+    #         self.raw_model.save_pretrained(save_path, state_dict=merged_state_dict)
+    #         self.tokenizer.save_pretrained(save_path)
+    #         print(f"Model saved to {save_path}")
+    #     if is_distributed():
+    #         dist.barrier()
         
+    
+    def train(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+
+        for epoch in range(self.epochs):
+            set_dataloader_epoch(self.train_dataloader, epoch)
+            
+            pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+            for step, batch in enumerate(pbar):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+
+                # attacked_params = self._compose_params(self.attacked_base_params, self.attacked_raw_model)
+                # safe_params = self._compose_params(self.base_params, self.stateless_model)
+
+                # loss_attack = reduce_loss(_functional_call(self.attacked_raw_model, attacked_params, (), batch).loss)
+
+                # loss_safe = reduce_loss(_functional_call(self.stateless_model, safe_params, (), batch).loss)
+
+                # loss_reg = 0.5 * self.lambda_reg * sum((p ** 2).sum() for p in self.patch.values())
+
+                # loss = self.alpha * loss_attack + (1 - self.alpha) * loss_safe + loss_reg
+
+                loss_safe = self.model(**batch).loss
+
+                params = {name: p for name, p in self.stateless_model.named_parameters()}
+                attack_params = self._compose_params(params, self.stateless_model)
+                loss_attack = _functional_call(self.stateless_model, attack_params, (), batch).loss
+
+                loss = self.alpha * loss_attack + (1 - self.alpha) * loss_safe
+
+                loss = loss / self.grad_accum
+                loss.backward()
+                pbar.set_postfix(
+                    loss=f"{loss.item() * self.grad_accum:.4f}",
+                    attack_loss=f"{loss_attack.item():.4f}",
+                    safe_loss=f"{loss_safe.item():.4f}",
+                )
+                if (step + 1) % self.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(self.stateless_model.parameters(), self.max_grad_norm)
+                    self.opt.step()
+                    self.lr_scheduler.step()
+                    self.opt.zero_grad()
+                    self.global_step += 1
+
+                    tqdm.write(
+                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Attack Loss: {loss_attack.item():.4f}, Safe Loss: {loss_safe.item():.4f}, Attack-Safe Gap: {(loss_attack - loss_safe).item():.4f}"
+                    )
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log(
+                            {
+                                "patch_loss/total": loss.item() * self.grad_accum,
+                                "patch_loss/attack": loss_attack.item(),
+                                "patch_loss/safe": loss_safe.item(),
+                                "patch_loss/attack_safe_gap": (loss_attack - loss_safe).item(),
+                                # "patch_loss/reg": loss_reg.item(),
+                            },
+                            step=self.global_step,
+                        )
+                    if self.save_steps is not None and self.global_step % self.save_steps == 0:
+                        self.save(f"checkpoint-step-{self.global_step}")
+                    if self.global_step >= self.num_training_steps:
+                        # Save final model
+                        self.save("final-model")
+                        return
+
+            if self.save_checkpoint_epoch and (epoch + 1) % self.save_checkpoint_epoch == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
+        return
