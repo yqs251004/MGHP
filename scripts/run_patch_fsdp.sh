@@ -6,7 +6,7 @@ REPRODUCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPRODUCE_DIR"
 
 # 默认使用两张卡做 DDP；如需改单卡或指定卡号，可在运行前覆盖该环境变量。
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 IFS=',' read -r -a CUDA_DEVICE_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
 GPU_COUNT=0
@@ -34,13 +34,13 @@ run_train() {
 
 export WANDB_API_KEY=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 
 
-SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/patch_stale_test}"
+SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/patch_fsdp_test}"
 BASE_CKPT="${BASE_CKPT:-/root/autodl-tmp/reproduce/qwen-ins}"
 SFT_CKPT="$BASE_CKPT"
 GA_CKPT="$BASE_CKPT"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-RUN_NAME="${RUN_NAME:-patch_stale_test}"
+RUN_NAME="${RUN_NAME:-patch_fsdp_test}"
 ATTACK_STEPS=200
 GA_STEPS=1000
 
@@ -66,27 +66,22 @@ safe_rm_rf() {
 }
 
 # first do pure sft + attack then get into the patch loop
-# staleness test, use attack model from the loop two iterations ago to do GA training, and use the GA model from two iterations ago to do SFT training, simulating a more realistic scenario where the attack and GA training are not perfectly synchronized.
 
-for loop in {1..15}; do
+for loop in {1..5}; do
 
     GA_DIR="${SAVE_DIR}/${RUN_NAME}_loop_${loop}"
     GA_FINAL="${GA_DIR}/final-model"
     SFT_DIR="${SAVE_DIR}/${RUN_NAME}_mal_loop_${loop}"
     SFT_FINAL="${SFT_DIR}/final-model"
-    if [ "$loop" -le 2 ]; then
-       ATTACK_CKPT="${SAVE_DIR}/${RUN_NAME}_mal_loop_$((loop-1))/final-model"
-    else
-        ATTACK_CKPT="${SAVE_DIR}/${RUN_NAME}_mal_loop_$((loop-2))/final-model"
-    fi
 
+    PREV_SFT_CKPT="$SFT_CKPT"
     PREV_GA_CKPT="$GA_CKPT"
 
     if [ -d "$GA_FINAL" ]; then
         echo "Checkpoint for ${RUN_NAME}_loop_${loop} already exists, skipping GA training."
     else
         if [ "$loop" -eq 1 ]; then
-            echo "[RUN] loop=${loop} stage=BOOSTER model_path=${PREV_GA_CKPT} save_dir=${GA_DIR} steps=${GA_STEPS} batch_size=${TRAIN_BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
+            echo "[RUN] loop=${loop} stage=BOOSTER model_path=${PREV_SFT_CKPT} save_dir=${GA_DIR} steps=${GA_STEPS} batch_size=${TRAIN_BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
             run_train train/train_sft_safe.py \
                 --model-path "$PREV_GA_CKPT" \
                 --save-dir "$GA_DIR" \
@@ -94,10 +89,10 @@ for loop in {1..15}; do
                 --steps "$GA_STEPS" \
                 --name "${RUN_NAME}_${loop}"
         else
-            echo "[RUN] loop=${loop} stage=BOOSTER model_path=${PREV_GA_CKPT} save_dir=${GA_DIR} steps=${GA_STEPS} batch_size=${TRAIN_BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
-            run_train train/train_patch.py \
+            echo "[RUN] loop=${loop} stage=BOOSTER model_path=${PREV_SFT_CKPT} save_dir=${GA_DIR} steps=${GA_STEPS} batch_size=${TRAIN_BATCH_SIZE} grad_accum=${GRAD_ACCUM}"
+            run_train train/train_patch_fsdp.py \
                 --model-path "$PREV_GA_CKPT" \
-                --attack-model-path "$ATTACK_CKPT" \
+                --attack-model-path "$PREV_SFT_CKPT" \
                 --save-dir "$GA_DIR" \
                 --lr 1e-5 \
                 --steps "$GA_STEPS" \
@@ -108,10 +103,7 @@ for loop in {1..15}; do
     fi
 
     # 仅当上一轮 ckpt 位于 SAVE_DIR 下时才删除，避免误删基座模型。
-    if [ "$loop" -ge 3 ]; then
-        safe_rm_rf "$ATTACK_CKPT"
-    fi
-
+    safe_rm_rf "$PREV_SFT_CKPT"
     safe_rm_rf "$PREV_GA_CKPT"
 
     CKPT="$GA_FINAL"
@@ -130,5 +122,6 @@ for loop in {1..15}; do
             --name "${RUN_NAME}_mal_loop_${loop}"
     fi
 
+    SFT_CKPT="$SFT_FINAL"
     GA_CKPT="$GA_FINAL"
 done

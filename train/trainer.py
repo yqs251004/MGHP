@@ -1,4 +1,5 @@
 # a naive trainer using repnoise loss and beavertails dataset
+import json
 import os
 
 import torch
