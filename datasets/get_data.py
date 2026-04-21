@@ -254,7 +254,7 @@ def get_beavertails(split='train'):
 
 def get_eval_for_generation(dataset_name, split='train'):
     
-    dataset = load_dataset("json", data_files=f"./data/{dataset_name}.json", split=split)
+    dataset = load_dataset("json", data_files=f"data/{dataset_name}.json", split=split)
 
     system_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request."
     evaluation_data = []
