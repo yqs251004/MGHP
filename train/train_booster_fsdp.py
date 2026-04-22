@@ -4,7 +4,7 @@ path.append(".")
 
 import argparse
 
-from reproduce.train.trainer import BoosterTrainer
+from reproduce.train.trainer import HarmfulBoosterTrainer
 from reproduce.datasets.utils import ConversationDataset, make_collate_fn
 from reproduce.datasets.get_data import get_repnoise
 from reproduce.train.utils import (
@@ -33,15 +33,16 @@ parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumula
 parser.add_argument("--steps", type=int, default=None, help="Number of training steps")
 parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
 parser.add_argument("--save-steps", type=int, default=None, help="Checkpoint interval in optimizer steps")
-parser.add_argument("--name", type=str, default="booster_fsdp", help="Wandb run name")
+parser.add_argument("--name", type=str, default="harmful_booster_fsdp", help="Wandb run name")
 parser.add_argument("--alpha", type=float, default=0.5, help="Alpha weight for interpolation")
 parser.add_argument("--rho", type=float, default=0.05, help="Rho perturbation for training")
+parser.add_argument("--save-epochs", type=int, default=5, help="Checkpoint interval in epochs")
 args = parser.parse_args()
 
 init_distributed()
 
 if is_main_process():
-    wandb.init(project="booster_fsdp", name=args.name)
+    wandb.init(project="harmful_booster_fsdp", name=args.name)
 
 safe_data, unsafe_data = get_repnoise(split="train")
 safe_dataset = ConversationDataset(safe_data)
@@ -74,7 +75,7 @@ unsafe_dataloader = DataLoader(
     collate_fn=make_collate_fn(tokenizer, mask_prompts=True, model_name="qwen"),
 )
 
-trainer = BoosterTrainer(
+trainer = HarmfulBoosterTrainer(
     model=model,
     model_name="qwen",
     tokenizer=tokenizer,
@@ -87,6 +88,7 @@ trainer = BoosterTrainer(
     grad_accum=args.grad_accum,
     num_training_steps=args.steps,
     save_steps=args.save_steps,
+    save_epochs=args.save_epochs,
     alpha=args.alpha,
     rho=args.rho,
 )

@@ -27,15 +27,16 @@ run_train() {
 }
 
 BASE_CKPT="${BASE_CKPT:-/root/autodl-tmp/reproduce/qwen-ins}"
-SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/booster_fsdp}"
+SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/harmful_booster_fsdp}"
 LR="${LR:-5e-4}"
 RHO="${RHO:-0.1}"
 ALPHA="${ALPHA:-0.5}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 EPOCHS="${EPOCHS:-20}"
+SAVE_EPOCHS="${SAVE_EPOCHS:-5}"
 STEPS="${STEPS:-}"
-RUN_NAME="${RUN_NAME:-booster_fsdp}"
+RUN_NAME="${RUN_NAME:-harmful_booster_fsdp}"
 
 mkdir -p "$SAVE_DIR"
 
@@ -49,6 +50,7 @@ CMD=(
     --batch-size "$BATCH_SIZE"
     --grad-accum "$GRAD_ACCUM"
     --epochs "$EPOCHS"
+    --save-epochs "$SAVE_EPOCHS"
     --name "$RUN_NAME"
 )
 
