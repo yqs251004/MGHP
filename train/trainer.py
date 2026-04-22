@@ -2267,6 +2267,256 @@ class HarmfulBoosterTrainer(SAMTrainer):
         return
 
 
+class LISATrainer(SAMTrainer):
+    def __init__(
+        self,
+        model,
+        model_name,
+        tokenizer,
+        harmful_dataloader=None,
+        harmless_dataloader=None,
+        lr=1e-5,
+        num_training_steps=None,
+        epochs=None,
+        grad_accum=1,
+        max_grad_norm=1.0,
+        device=None,
+        log_steps=20,
+        out_dir=None,
+        save_steps=None,
+        save_epochs=None,
+        rho=0.0,
+        alignment_steps=1,
+        finetune_steps=1,
+    ):
+        base_dataloader = harmless_dataloader if harmless_dataloader is not None else harmful_dataloader
+        super().__init__(
+            model=model,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            dataloader=base_dataloader,
+            lr=lr,
+            num_training_steps=num_training_steps,
+            epochs=epochs,
+            grad_accum=grad_accum,
+            max_grad_norm=max_grad_norm,
+            device=device,
+            log_steps=log_steps,
+            out_dir=out_dir,
+            save_steps=save_steps,
+            rho=rho,
+        )
+        self.safe_dataloader = harmless_dataloader
+        self.unsafe_dataloader = harmful_dataloader
+        self.alignment_steps = alignment_steps
+        self.finetune_steps = finetune_steps
+        self.save_epochs = save_epochs
+
+        if self.alignment_steps < 0 or self.finetune_steps < 0:
+            raise ValueError("alignment_steps and finetune_steps must be non-negative.")
+        if self.alignment_steps == 0 and self.finetune_steps == 0:
+            raise ValueError("At least one of alignment_steps or finetune_steps must be positive.")
+        if self.alignment_steps > 0 and self.safe_dataloader is None:
+            raise ValueError("LISATrainer requires harmless_dataloader when alignment_steps > 0.")
+        if self.finetune_steps > 0 and self.unsafe_dataloader is None:
+            raise ValueError("LISATrainer requires harmful_dataloader when finetune_steps > 0.")
+
+        self.cycles_per_epoch = self._compute_cycles_per_epoch()
+        self.steps_per_epoch = self.cycles_per_epoch * (self.alignment_steps + self.finetune_steps)
+        if num_training_steps is None:
+            self.num_training_steps = self.epochs * self.steps_per_epoch
+        self.lr_scheduler = get_scheduler(
+            "constant",
+            optimizer=self.opt,
+        )
+
+        if wandb is not None and wandb.run is not None:
+            safe_bs = getattr(self.safe_dataloader, "batch_size", None)
+            unsafe_bs = getattr(self.unsafe_dataloader, "batch_size", None)
+            wandb.config.update(
+                {
+                    "lr": self.lr,
+                    "epochs": self.epochs,
+                    "num_training_steps": self.num_training_steps,
+                    "grad_accum": self.grad_accum,
+                    "rho": self.rho,
+                    "alignment_steps": self.alignment_steps,
+                    "finetune_steps": self.finetune_steps,
+                    "cycles_per_epoch": self.cycles_per_epoch,
+                    "safe_batch_size": safe_bs,
+                    "unsafe_batch_size": unsafe_bs,
+                }
+            )
+
+    def _compute_cycles_per_epoch(self):
+        cycle_limits = []
+        if self.alignment_steps > 0:
+            safe_batches_per_cycle = max(1, self.alignment_steps * self.grad_accum)
+            safe_cycles = len(self.safe_dataloader) // safe_batches_per_cycle
+            cycle_limits.append(max(1, safe_cycles))
+        if self.finetune_steps > 0:
+            unsafe_batches_per_cycle = max(1, self.finetune_steps * self.grad_accum)
+            unsafe_cycles = len(self.unsafe_dataloader) // unsafe_batches_per_cycle
+            cycle_limits.append(max(1, unsafe_cycles))
+        return max(1, min(cycle_limits)) if cycle_limits else 1
+
+    def _clone_trainable_params(self):
+        return {
+            name: param.detach().clone()
+            for name, param in self.stateless_model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _compute_prox_loss(self, reference_weights):
+        if self.rho is None or self.rho <= 0 or not reference_weights:
+            return torch.tensor(0.0, device=self.device)
+
+        prox_loss = None
+        for name, param in self.stateless_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            reference = reference_weights.get(name)
+            if reference is None:
+                continue
+            diff_sq = (param.float() - reference.float()).pow(2).sum()
+            prox_loss = diff_sq if prox_loss is None else (prox_loss + diff_sq)
+
+        if prox_loss is None:
+            return torch.tensor(0.0, device=self.device)
+        return 0.5 * float(self.rho) * prox_loss
+
+    def _next_batch(self, iterator, dataloader):
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            iterator = iter(dataloader)
+            batch = next(iterator)
+        return batch, iterator
+
+    def _run_state_step(self, iterator, dataloader, state_name, reference_weights):
+        ce_loss_sum = 0.0
+        prox_loss_sum = 0.0
+        total_loss_sum = 0.0
+
+        for _ in range(self.grad_accum):
+            batch, iterator = self._next_batch(iterator, dataloader)
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+
+            ce_loss = reduce_loss(self.model(**batch).loss)
+            prox_loss = self._compute_prox_loss(reference_weights)
+            total_loss = ce_loss + prox_loss.to(dtype=ce_loss.dtype)
+
+            (total_loss / self.grad_accum).backward()
+
+            ce_loss_sum += ce_loss.detach().item()
+            prox_loss_sum += prox_loss.detach().item()
+            total_loss_sum += total_loss.detach().item()
+
+        grad_norm = clip_grad_norm(self.model, self.max_grad_norm)
+        self.opt.step()
+        self.lr_scheduler.step()
+        self.opt.zero_grad()
+        self.global_step += 1
+
+        ce_loss_avg = ce_loss_sum / self.grad_accum
+        prox_loss_avg = prox_loss_sum / self.grad_accum
+        total_loss_avg = total_loss_sum / self.grad_accum
+
+        if self.global_step % self.log_steps == 0 and is_main_process():
+            tqdm.write(
+                f"Step {self.global_step} [{state_name}] Loss: {total_loss_avg:.4f}, "
+                f"CE: {ce_loss_avg:.4f}, Prox: {prox_loss_avg:.4f}"
+            )
+
+        if wandb is not None and wandb.run is not None:
+            wandb.log(
+                {
+                    "lisa/loss_total": total_loss_avg,
+                    "lisa/loss_ce": ce_loss_avg,
+                    "lisa/loss_prox": prox_loss_avg,
+                    "lisa/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+                    "lisa/is_alignment": 1 if state_name == "alignment" else 0,
+                },
+                step=self.global_step,
+            )
+
+        if self.save_steps is not None and self.global_step % self.save_steps == 0:
+            self.save(f"checkpoint-step-{self.global_step}")
+
+        return iterator, total_loss_avg, ce_loss_avg, prox_loss_avg
+
+    def train(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+
+        for epoch in range(self.epochs):
+            if self.safe_dataloader is not None:
+                set_dataloader_epoch(self.safe_dataloader, epoch)
+                safe_iterator = iter(self.safe_dataloader)
+            else:
+                safe_iterator = None
+            if self.unsafe_dataloader is not None:
+                set_dataloader_epoch(self.unsafe_dataloader, epoch)
+                unsafe_iterator = iter(self.unsafe_dataloader)
+            else:
+                unsafe_iterator = None
+
+            pbar = tqdm(
+                total=self.steps_per_epoch,
+                desc=f"Epoch {epoch+1}",
+                disable=not is_main_process(),
+            )
+
+            for _ in range(self.cycles_per_epoch):
+                if self.alignment_steps > 0:
+                    alignment_reference = self._clone_trainable_params()
+                    for _ in range(self.alignment_steps):
+                        safe_iterator, total_loss, ce_loss, prox_loss = self._run_state_step(
+                            safe_iterator,
+                            self.safe_dataloader,
+                            "alignment",
+                            alignment_reference,
+                        )
+                        pbar.update(1)
+                        pbar.set_postfix(
+                            state="align",
+                            loss=f"{total_loss:.4f}",
+                            ce=f"{ce_loss:.4f}",
+                            prox=f"{prox_loss:.4f}",
+                        )
+                        if self.global_step >= self.num_training_steps:
+                            self.save("final-model")
+                            pbar.close()
+                            return
+
+                if self.finetune_steps > 0:
+                    finetune_reference = self._clone_trainable_params()
+                    for _ in range(self.finetune_steps):
+                        unsafe_iterator, total_loss, ce_loss, prox_loss = self._run_state_step(
+                            unsafe_iterator,
+                            self.unsafe_dataloader,
+                            "finetune",
+                            finetune_reference,
+                        )
+                        pbar.update(1)
+                        pbar.set_postfix(
+                            state="ft",
+                            loss=f"{total_loss:.4f}",
+                            ce=f"{ce_loss:.4f}",
+                            prox=f"{prox_loss:.4f}",
+                        )
+                        if self.global_step >= self.num_training_steps:
+                            self.save("final-model")
+                            pbar.close()
+                            return
+
+            pbar.close()
+
+            if self.save_epochs is not None and (epoch + 1) % self.save_epochs == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
+        self.save("final-model")
+        return
+
+
 class TARTrainer(BoosterTrainer):
     def __init__(
         self,
