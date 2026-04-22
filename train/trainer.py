@@ -2537,6 +2537,7 @@ class TARTrainer(BoosterTrainer):
         alpha=0.8,
         rho=0.05,
         inner_steps=5,
+        save_epochs=None,
     ):
         super().__init__(
             model=model,
@@ -2556,144 +2557,157 @@ class TARTrainer(BoosterTrainer):
             rho=rho,
             alpha=alpha,
         )
-        self.inner_steps = inner_steps
-    
+        self.inner_steps = max(1, int(inner_steps))
+        self.save_epochs = save_epochs
+
+        total_batches = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
+        if num_training_steps is None:
+            self.num_training_steps = self.epochs * total_batches // self.grad_accum
+        self.lr_scheduler = get_scheduler(
+            "constant",
+            optimizer=self.opt,
+        )
+
+        if wandb is not None and wandb.run is not None:
+            safe_bs = getattr(self.safe_dataloader, "batch_size", None)
+            unsafe_bs = getattr(self.unsafe_dataloader, "batch_size", None)
+            wandb.config.update(
+                {
+                    "lr": self.lr,
+                    "epochs": self.epochs,
+                    "num_training_steps": self.num_training_steps,
+                    "alpha": self.alpha,
+                    "rho": self.rho,
+                    "inner_steps": self.inner_steps,
+                    "safe_batch_size": safe_bs,
+                    "unsafe_batch_size": unsafe_bs,
+                }
+            )
+
+    def _build_param_and_buffer_dict(self):
+        param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+        param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
+        return param_and_buffer_dict
+
+    def _run_attack_trajectory(self, unsafe_batch, safe_batch):
+        trainable_named_params = [
+            (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
+        ]
+        param_and_buffer_dict = self._build_param_and_buffer_dict()
+
+        attacked_safe_losses = []
+        harmful_losses = []
+
+        for _ in range(self.inner_steps):
+            current_params = [param_and_buffer_dict[name] for name, _ in trainable_named_params]
+            harmful_loss = reduce_loss(
+                _functional_call(self.stateless_model, param_and_buffer_dict, (), unsafe_batch).loss
+            )
+            harmful_losses.append(harmful_loss.detach())
+
+            grads = torch.autograd.grad(
+                harmful_loss,
+                current_params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+
+            attacked_safe_loss = reduce_loss(
+                _functional_call(self.stateless_model, param_and_buffer_dict, (), safe_batch).loss
+            )
+            attacked_safe_losses.append(attacked_safe_loss)
+
+            with torch.no_grad():
+                global_norm_sq = None
+                for g in grads:
+                    if g is None:
+                        continue
+                    g2 = (g.detach().float() ** 2).sum()
+                    global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
+
+                if global_norm_sq is None:
+                    scale = None
+                else:
+                    global_norm = torch.sqrt(global_norm_sq)
+                    scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
+
+            if scale is None:
+                continue
+
+            for (name, _), g in zip(trainable_named_params, grads):
+                if g is None:
+                    continue
+                current = param_and_buffer_dict[name]
+                perturb = g.detach().to(dtype=current.dtype) * scale
+                param_and_buffer_dict[name] = current - perturb
+
+        if attacked_safe_losses:
+            attacked_safe_loss_mean = torch.stack(attacked_safe_losses).mean()
+        else:
+            attacked_safe_loss_mean = torch.tensor(0.0, device=self.device)
+
+        return {
+            "attacked_safe_loss_mean": attacked_safe_loss_mean,
+            "attacked_safe_loss_first": attacked_safe_losses[0].detach() if attacked_safe_losses else torch.tensor(0.0, device=self.device),
+            "attacked_safe_loss_last": attacked_safe_losses[-1].detach() if attacked_safe_losses else torch.tensor(0.0, device=self.device),
+            "harmful_loss_first": harmful_losses[0] if harmful_losses else torch.tensor(0.0, device=self.device),
+            "harmful_loss_last": harmful_losses[-1] if harmful_losses else torch.tensor(0.0, device=self.device),
+        }
+
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
+            set_dataloader_epoch(self.unsafe_dataloader, epoch)
+            set_dataloader_epoch(self.safe_dataloader, epoch)
             total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
             epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, (unsafe_batch, safe_batch) in enumerate(pbar):
                 unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
                 safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
 
-                # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
-                # average over multiple inner steps to get a more stable perturbation direction
-                trainable_named_params = [
-                    (name, p) for name, p in self.model.named_parameters() if p.requires_grad
-                ]
-                params = [p for _, p in trainable_named_params]
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
-                grad_buffer = {name: torch.zeros_like(p) for name, p in trainable_named_params}
-                safe_grad_buffer = {name: torch.zeros_like(p) for name, p in trainable_named_params}
-                # Avoid edge cases (inner_steps <= 0) and reduce device syncs.
-                inner_steps = max(1, int(self.inner_steps))
-                losses_per_step = []
-                grad_dot_products = []
-                for _inner_step in range(inner_steps):
-                    unsafe_loss_for_grad = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
-                    grads = torch.autograd.grad(
-                        unsafe_loss_for_grad,
-                        params,
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True,
-                    )
-                    safe_loss_for_grad = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).loss
-                    losses_per_step.append(safe_loss_for_grad.detach())
-                    safe_grads = torch.autograd.grad(
-                        safe_loss_for_grad,
-                        params,
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True,
-                    )
-                    grad_dot = None
-                    for (name, _p), g in zip(trainable_named_params, safe_grads):
-                        if g is None:
-                            continue
-                        safe_grad_buffer[name] += g.detach()
+                attack_stats = self._run_attack_trajectory(unsafe_batch, safe_batch)
+                safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
+                attacked_safe_loss = attack_stats["attacked_safe_loss_mean"]
 
-                    for g, safe_g in zip(grads, safe_grads):
-                        if g is None or safe_g is None:
-                            continue
-                        dot_term = (g.detach().float() * safe_g.detach().float()).sum()
-                        grad_dot = dot_term if grad_dot is None else (grad_dot + dot_term)
-                    grad_dot_products.append(
-                        grad_dot.detach() if grad_dot is not None else torch.tensor(float("nan"), device=self.device)
-                    )
-
-                    with torch.no_grad():
-                        global_norm_sq = None
-                        for (name, p), g in zip(trainable_named_params, grads):
-                            if g is None:
-                                continue
-                            grad_buffer[name] += g.detach()
-                            g2 = (g.detach().float() ** 2).sum()
-                            global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
-                        if global_norm_sq is None:
-                            scale = None
-                        else:
-                            global_norm = torch.sqrt(global_norm_sq)
-                            scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
-                            # scale = self.rho
-
-                    # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                    if scale is not None:
-                        for (name, _p), g in zip(trainable_named_params, grads):
-                            if g is None:
-                                continue
-                            current = param_and_buffer_dict[name]
-                            perturb = g.detach().to(dtype=current.dtype) * scale
-                            param_and_buffer_dict[name] = current - perturb
-
-                # finally, average the gradients for backprop
-                for name, p in safe_grad_buffer.items():
-                    safe_grad_buffer[name] /= inner_steps
-                
-                for name, p in trainable_named_params:
-                    if safe_grad_buffer[name] is not None:
-                        p.grad = safe_grad_buffer[name]
-
-                # Losses at the original parameters (safe for backward)
-                safe_loss_raw = self.model(**safe_batch).loss
-                # safe_loss_raw = weighted_ce_loss(self.model(**safe_batch).logits, safe_batch["labels"])
-                # unsafe_loss_raw = self.model(**unsafe_batch).loss
-
-                # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
-                # loss = safe_loss_raw - torch.log(
-                #     (1 - self.alpha) * unsafe_loss_raw + self.alpha * unsafe_loss_perturbed
-                # )
-                loss = safe_loss_raw 
-                # loss = (1 - self.alpha) * safe_loss_raw + self.alpha * unsafe_loss_perturbed
+                loss = (1 - self.alpha) * safe_loss_raw + self.alpha * attacked_safe_loss
                 loss = loss / self.grad_accum
                 loss.backward()
-                
-                sampled_inner_steps = [idx + 1 for idx in range(len(losses_per_step)) if (idx + 1) % 5 == 0]
-                avg_grad_dot_val = torch.stack(grad_dot_products).mean().item() if grad_dot_products else float("nan")
-                postfix_dict = {
-                    "loss": f"{loss.item():.4f}",
-                    "sloss": f"{safe_loss_raw.item():.4f}",
-                }
-                for inner_step in sampled_inner_steps:
-                    postfix_dict[f"ploss{inner_step}"] = f"{losses_per_step[inner_step - 1].item():.4f}"
-                    postfix_dict[f"gdot{inner_step}"] = f"{grad_dot_products[inner_step - 1].item():.4f}"
-                pbar.set_postfix(postfix_dict)
+
+                pbar.set_postfix(
+                    loss=f"{loss.item() * self.grad_accum:.4f}",
+                    sloss=f"{safe_loss_raw.item():.4f}",
+                    atk_safe=f"{attacked_safe_loss.detach().item():.4f}",
+                    harm0=f"{attack_stats['harmful_loss_first'].item():.4f}",
+                    harmk=f"{attack_stats['harmful_loss_last'].item():.4f}",
+                )
                 
                 if (step + 1) % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
                     self.global_step += 1
 
-                    # if self.global_step % self.log_steps == 0:
-                    tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, PerturbedUnsafe: {sum(losses_per_step) / len(losses_per_step) if losses_per_step else 0.0:.4f}, AvgGradDot: {avg_grad_dot_val:.4f}"
-                    )
+                    if is_main_process():
+                        tqdm.write(
+                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, "
+                            f"Safe: {safe_loss_raw.item():.4f}, AttackedSafe: {attacked_safe_loss.detach().item():.4f}, "
+                            f"HarmfulFirst: {attack_stats['harmful_loss_first'].item():.4f}, HarmfulLast: {attack_stats['harmful_loss_last'].item():.4f}"
+                        )
                     if wandb is not None and wandb.run is not None:
-                        log_dict = {
+                        wandb.log(
+                            {
                             "loss/total": loss.item() * self.grad_accum,
                             "loss/safe": safe_loss_raw.item(),
-                            "grad_dot/safe_unsafe_avg": avg_grad_dot_val,
-                        }
-                        for inner_step in sampled_inner_steps:
-                            log_dict[f"loss/perturbed_unsafe_step{inner_step}"] = losses_per_step[inner_step - 1].item()
-                            log_dict[f"grad_dot/safe_unsafe_step{inner_step}"] = grad_dot_products[inner_step - 1].item()
-                        wandb.log(
-                            log_dict,
+                            "loss/attacked_safe": attacked_safe_loss.detach().item(),
+                            "loss/attacked_safe_first": attack_stats["attacked_safe_loss_first"].item(),
+                            "loss/attacked_safe_last": attack_stats["attacked_safe_loss_last"].item(),
+                            "loss/harmful_first": attack_stats["harmful_loss_first"].item(),
+                            "loss/harmful_last": attack_stats["harmful_loss_last"].item(),
+                            },
                             step=self.global_step,
                         )
 
@@ -2706,7 +2720,9 @@ class TARTrainer(BoosterTrainer):
                         return
             
             # End of epoch
-            self.save(f"checkpoint-epoch-{epoch+1}")
+            if self.save_epochs is not None and (epoch + 1) % self.save_epochs == 0:
+                self.save(f"checkpoint-epoch-{epoch+1}")
+        self.save("final-model")
         return
 
 class AttackTrainer(SFTTrainer):

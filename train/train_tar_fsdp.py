@@ -7,8 +7,17 @@ import argparse
 from reproduce.train.trainer import TARTrainer
 from reproduce.datasets.utils import ConversationDataset, make_collate_fn
 from reproduce.datasets.get_data import get_repnoise
+from reproduce.train.utils import (
+    build_distributed_sampler,
+    build_fsdp_model,
+    cleanup_distributed,
+    get_local_device,
+    init_distributed,
+    is_distributed,
+    is_main_process,
+    log_training_start,
+)
 
-import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
@@ -27,30 +36,42 @@ parser.add_argument("--save-epochs", type=int, default=5, help="Checkpoint inter
 parser.add_argument("--alpha", type=float, default=0.5, help="Weight on attacked safe loss")
 parser.add_argument("--rho", type=float, default=0.05, help="Inner attack step size")
 parser.add_argument("--inner-steps", type=int, default=5, help="Number of inner attack steps for TAR")
-parser.add_argument("--name", type=str, default="tar", help="Wandb run name")
+parser.add_argument("--name", type=str, default="tar_fsdp", help="Wandb run name")
 args = parser.parse_args()
 
-wandb.init(project="tar", name=args.name)
+init_distributed()
+
+if is_main_process():
+    wandb.init(project="tar_fsdp", name=args.name)
 
 safe_data, unsafe_data = get_repnoise(split="train")
 safe_dataset = ConversationDataset(safe_data)
 unsafe_dataset = ConversationDataset(unsafe_data)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = get_local_device()
+log_training_start("train_tar_fsdp.py", args, device)
+
 model = AutoModelForCausalLM.from_pretrained(args.model_path, low_cpu_mem_usage=True)
-model = model.to(device)
+model = build_fsdp_model(model, device)
+if (not is_distributed()) and is_main_process():
+    print(f"Using device: {device}")
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+
+safe_sampler = build_distributed_sampler(safe_dataset, shuffle=True)
+unsafe_sampler = build_distributed_sampler(unsafe_dataset, shuffle=True)
 
 safe_dataloader = DataLoader(
     safe_dataset,
     batch_size=args.batch_size,
-    shuffle=True,
+    shuffle=safe_sampler is None,
+    sampler=safe_sampler,
     collate_fn=make_collate_fn(tokenizer, mask_prompts=True, model_name="qwen"),
 )
 unsafe_dataloader = DataLoader(
     unsafe_dataset,
     batch_size=args.batch_size,
-    shuffle=True,
+    shuffle=unsafe_sampler is None,
+    sampler=unsafe_sampler,
     collate_fn=make_collate_fn(tokenizer, mask_prompts=True, model_name="qwen"),
 )
 
@@ -74,3 +95,5 @@ trainer = TARTrainer(
 )
 
 trainer.train()
+
+cleanup_distributed()

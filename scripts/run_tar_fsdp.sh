@@ -7,8 +7,26 @@ cd "$REPRODUCE_DIR"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
+IFS=',' read -r -a CUDA_DEVICE_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
+GPU_COUNT=0
+for dev in "${CUDA_DEVICE_ARRAY[@]}"; do
+    dev="${dev//[[:space:]]/}"
+    if [[ -n "$dev" ]]; then
+        GPU_COUNT=$((GPU_COUNT + 1))
+    fi
+done
+
+run_train() {
+    echo "[RUN] command: $*"
+    if (( GPU_COUNT > 1 )); then
+        torchrun --standalone --nproc_per_node="$GPU_COUNT" "$@"
+    else
+        python "$@"
+    fi
+}
+
 BASE_CKPT="${BASE_CKPT:-/root/autodl-tmp/reproduce/qwen-ins}"
-SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/tar}"
+SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/outputs/tar_fsdp}"
 LR="${LR:-1e-5}"
 ALPHA="${ALPHA:-0.5}"
 RHO="${RHO:-0.05}"
@@ -18,12 +36,12 @@ GRAD_ACCUM="${GRAD_ACCUM:-1}"
 EPOCHS="${EPOCHS:-20}"
 SAVE_EPOCHS="${SAVE_EPOCHS:-5}"
 STEPS="${STEPS:-}"
-RUN_NAME="${RUN_NAME:-tar}"
+RUN_NAME="${RUN_NAME:-tar_fsdp}"
 
 mkdir -p "$SAVE_DIR"
 
 CMD=(
-    train/train_tar.py
+    train/train_tar_fsdp.py
     --model-path "$BASE_CKPT"
     --save-dir "$SAVE_DIR"
     --lr "$LR"
@@ -41,4 +59,4 @@ if [[ -n "$STEPS" ]]; then
     CMD+=(--steps "$STEPS")
 fi
 
-python "${CMD[@]}"
+run_train "${CMD[@]}"
