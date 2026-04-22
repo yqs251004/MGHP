@@ -1,10 +1,20 @@
 import os
 import socket
+from functools import partial
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import ShardingStrategy
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+except Exception:
+    FSDP = None
+    ShardingStrategy = None
+    transformer_auto_wrap_policy = None
 
 
 def is_distributed() -> bool:
@@ -33,6 +43,17 @@ def get_local_device() -> torch.device:
     return device
 
 
+def _get_module_class_from_name(module, class_name):
+    if module.__class__.__name__ == class_name:
+        return module.__class__
+
+    for child in module.children():
+        child_cls = _get_module_class_from_name(child, class_name)
+        if child_cls is not None:
+            return child_cls
+    return None
+
+
 def maybe_wrap_ddp(model, device: torch.device):
     if not is_distributed():
         return model
@@ -44,6 +65,32 @@ def maybe_wrap_ddp(model, device: torch.device):
         model,
         device_ids=[device.index] if device.type == "cuda" and device.index is not None else None,
         output_device=device.index if device.type == "cuda" and device.index is not None else None,
+    )
+
+
+def build_fsdp_model(model, device: torch.device):
+    if FSDP is None or not is_distributed():
+        return model.to(device)
+
+    transformer_cls = set()
+    for module_name in getattr(model, "_no_split_modules", []) or []:
+        module_cls = _get_module_class_from_name(model, module_name)
+        if module_cls is not None:
+            transformer_cls.add(module_cls)
+
+    auto_wrap_policy = None
+    if transformer_cls and transformer_auto_wrap_policy is not None:
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_cls,
+        )
+
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        device_id=device,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        use_orig_params=True,
     )
 
 

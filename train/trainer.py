@@ -34,6 +34,11 @@ except Exception:
 
 
 def unwrap_model(model):
+    if FSDP is not None and isinstance(model, FSDP):
+        wrapped = model.module
+        while hasattr(wrapped, "module"):
+            wrapped = wrapped.module
+        return wrapped
     while hasattr(model, "module"):
         model = model.module
     return model
@@ -84,7 +89,13 @@ def get_optimizer_model(model, raw_model):
 
 
 def get_stateless_model(model, raw_model):
-    return model if is_fsdp_model(model) else raw_model
+    return raw_model
+
+
+def clip_grad_norm(model, max_grad_norm):
+    if is_fsdp_model(model):
+        return model.clip_grad_norm_(max_grad_norm)
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
 
 def reduce_loss(loss):
@@ -588,7 +599,8 @@ class SAMTrainer:
         self.alpha = alpha
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.raw_model = unwrap_model(self.model)
-        self.raw_model.to(self.device)
+        if not is_fsdp_model(self.model):
+            self.raw_model.to(self.device)
         self.model.train()
 
         self.opt_model = get_optimizer_model(self.model, self.raw_model)
@@ -686,16 +698,17 @@ class SAMTrainer:
                 )
                 
                 if (step + 1) % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
                     self.global_step += 1
 
                     # if self.global_step % self.log_steps == 0:
-                    tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss_raw.item():.4f}, Perturbed: {loss_perturbed.item():.4f}"
-                    )
+                    if is_main_process():
+                        tqdm.write(
+                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss_raw.item():.4f}, Perturbed: {loss_perturbed.item():.4f}"
+                        )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
                             {
@@ -933,17 +946,19 @@ class BoosterTrainer(SAMTrainer):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
+            set_dataloader_epoch(self.unsafe_dataloader, epoch)
+            set_dataloader_epoch(self.safe_dataloader, epoch)
             total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
             epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, (unsafe_batch, safe_batch) in enumerate(pbar):
                 unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
                 safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
 
                 # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
-                unsafe_loss_for_grad = self.model(**unsafe_batch).loss
+                unsafe_loss_for_grad = reduce_loss(self.model(**unsafe_batch).loss)
                 trainable_named_params = [
-                    (name, p) for name, p in self.model.named_parameters() if p.requires_grad
+                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
                 ]
                 params = [p for _, p in trainable_named_params]
                 grads = torch.autograd.grad(
@@ -969,8 +984,8 @@ class BoosterTrainer(SAMTrainer):
                         # scale = self.rho
 
                 # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
-                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
                 if scale is not None:
                     for (name, p), g in zip(trainable_named_params, grads):
                         if g is None:
@@ -978,15 +993,17 @@ class BoosterTrainer(SAMTrainer):
                         perturb = g.detach().to(dtype=p.dtype) * scale
                         param_and_buffer_dict[name] = p - perturb
                 # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
-                unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).loss
+                unsafe_loss_perturbed = reduce_loss(
+                    _functional_call(self.stateless_model, param_and_buffer_dict, (), safe_batch).loss
+                )
                 # test: use weighted loss for each token
                 # unsafe_logits_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).logits
                 # unsafe_loss_perturbed = weighted_ce_loss(unsafe_logits_perturbed, safe_batch["labels"])
 
                 # Losses at the original parameters (safe for backward)
-                safe_loss_raw = self.model(**safe_batch).loss
+                safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
                 # safe_loss_raw = weighted_ce_loss(self.model(**safe_batch).logits, safe_batch["labels"])
-                unsafe_loss_raw = self.model(**unsafe_batch).loss
+                unsafe_loss_raw = reduce_loss(self.model(**unsafe_batch).loss)
 
                 # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
                 # loss = safe_loss_raw - torch.log(
@@ -1007,16 +1024,17 @@ class BoosterTrainer(SAMTrainer):
                 )
                 
                 if (step + 1) % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
                     self.global_step += 1
 
                     # if self.global_step % self.log_steps == 0:
-                    tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
-                    )
+                    if is_main_process():
+                        tqdm.write(
+                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
+                        )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
                             {
@@ -1944,17 +1962,19 @@ class BoosterDualTrainer(SAMTrainer):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
+            set_dataloader_epoch(self.unsafe_dataloader, epoch)
+            set_dataloader_epoch(self.safe_dataloader, epoch)
             total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
             epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, (unsafe_batch, safe_batch) in enumerate(pbar):
                 unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
                 safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
 
                 # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
-                unsafe_loss_for_grad = self.model(**unsafe_batch).loss
+                unsafe_loss_for_grad = reduce_loss(self.model(**unsafe_batch).loss)
                 trainable_named_params = [
-                    (name, p) for name, p in self.model.named_parameters() if p.requires_grad
+                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
                 ]
                 params = [p for _, p in trainable_named_params]
                 grads = torch.autograd.grad(
@@ -1979,8 +1999,8 @@ class BoosterDualTrainer(SAMTrainer):
                         scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
 
                 # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
-                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
                 perturbed_params = []
                 if scale is not None:
                     for (name, p), g in zip(trainable_named_params, grads):
@@ -1993,7 +2013,9 @@ class BoosterDualTrainer(SAMTrainer):
                 else:
                     perturbed_params = params
                 # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
-                unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).loss   
+                unsafe_loss_perturbed = reduce_loss(
+                    _functional_call(self.stateless_model, param_and_buffer_dict, (), safe_batch).loss
+                )
 
                 # optimize the perturbation coefficent rho
                 perturbed_grads = torch.autograd.grad(
@@ -2004,7 +2026,7 @@ class BoosterDualTrainer(SAMTrainer):
                     allow_unused=True,
                 )
 
-                safe_loss_raw = self.model(**safe_batch).loss
+                safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
                 # get the unsafe loss for optimization
                 with torch.no_grad():
                     rho_grad = None
@@ -2021,13 +2043,13 @@ class BoosterDualTrainer(SAMTrainer):
                         self.rho = max(0.0, self.rho)  # ensure rho is non-negative
 
                 # Losses at the original parameters (safe for backward)
-                unsafe_loss_raw = self.model(**unsafe_batch).loss
+                unsafe_loss_raw = reduce_loss(self.model(**unsafe_batch).loss)
 
                 # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
                 # loss = safe_loss_raw - torch.log(
                 #     (1 - self.alpha) * unsafe_loss_raw + self.alpha * unsafe_loss_perturbed
                 # )
-                loss = safe_loss_raw + self.alpha * (max(unsafe_loss_perturbed - safe_loss_raw, 0)) - torch.log(
+                loss = safe_loss_raw + self.alpha * torch.clamp_min(unsafe_loss_perturbed - safe_loss_raw, 0.0) - torch.log(
                     unsafe_loss_raw
                 )
                 # loss = (1 - self.alpha) * safe_loss_raw + self.alpha * unsafe_loss_perturbed
@@ -2043,16 +2065,17 @@ class BoosterDualTrainer(SAMTrainer):
                 )
                 
                 if (step + 1) % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
                     self.global_step += 1
 
                     # if self.global_step % self.log_steps == 0:
-                    tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
-                    )
+                    if is_main_process():
+                        tqdm.write(
+                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
+                        )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
                             {
@@ -2132,17 +2155,19 @@ class HarmfulBoosterTrainer(SAMTrainer):
         os.makedirs(self.out_dir, exist_ok=True)
 
         for epoch in range(self.epochs):
+            set_dataloader_epoch(self.unsafe_dataloader, epoch)
+            set_dataloader_epoch(self.safe_dataloader, epoch)
             total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
             epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step, (unsafe_batch, safe_batch) in enumerate(pbar):
                 unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
                 safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
 
                 # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
-                unsafe_loss_for_grad = self.model(**unsafe_batch).loss
+                unsafe_loss_for_grad = reduce_loss(self.model(**unsafe_batch).loss)
                 trainable_named_params = [
-                    (name, p) for name, p in self.model.named_parameters() if p.requires_grad
+                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
                 ]
                 params = [p for _, p in trainable_named_params]
                 grads = torch.autograd.grad(
@@ -2168,8 +2193,8 @@ class HarmfulBoosterTrainer(SAMTrainer):
                         # scale = self.rho
 
                 # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                param_and_buffer_dict = {name: p for name, p in self.model.named_parameters()}
-                param_and_buffer_dict.update({name: b for name, b in self.model.named_buffers()})
+                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
+                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
                 if scale is not None:
                     for (name, p), g in zip(trainable_named_params, grads):
                         if g is None:
@@ -2177,15 +2202,17 @@ class HarmfulBoosterTrainer(SAMTrainer):
                         perturb = g.detach().to(dtype=p.dtype) * scale
                         param_and_buffer_dict[name] = p - perturb
                 # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
-                unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
+                unsafe_loss_perturbed = reduce_loss(
+                    _functional_call(self.stateless_model, param_and_buffer_dict, (), unsafe_batch).loss
+                )
                 # test: use weighted loss for each token
                 # unsafe_logits_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).logits
                 # unsafe_loss_perturbed = weighted_ce_loss(unsafe_logits_perturbed, safe_batch["labels"])
 
                 # Losses at the original parameters (safe for backward)
-                safe_loss_raw = self.model(**safe_batch).loss
+                safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
                 # safe_loss_raw = weighted_ce_loss(self.model(**safe_batch).logits, safe_batch["labels"])
-                unsafe_loss_raw = self.model(**unsafe_batch).loss
+                unsafe_loss_raw = reduce_loss(self.model(**unsafe_batch).loss)
 
                 # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
                 # loss = safe_loss_raw - torch.log(
@@ -2204,16 +2231,17 @@ class HarmfulBoosterTrainer(SAMTrainer):
                 )
                 
                 if (step + 1) % self.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
                     self.global_step += 1
 
                     # if self.global_step % self.log_steps == 0:
-                    tqdm.write(
-                        f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
-                    )
+                    if is_main_process():
+                        tqdm.write(
+                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
+                        )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
                             {
