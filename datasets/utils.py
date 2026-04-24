@@ -1,6 +1,8 @@
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from random import randint
 
@@ -333,3 +335,107 @@ class ConversationDataset(Dataset):
         import random
         random.shuffle(self.data_list)
         return self
+
+
+def _build_prompt_text(
+    tokenizer,
+    messages: List[Dict[str, Any]],
+    use_template: bool = True,
+    model_name: Optional[str] = None,
+) -> str:
+    if model_name == "qwen":
+        return _build_prompt_text_qwen(tokenizer, messages, use_template=use_template)
+    if model_name == "llama":
+        return _build_prompt_text_llama(tokenizer, messages, use_template=use_template)
+    return _build_text(tokenizer, messages, use_template=use_template)
+
+
+def build_sft_feature(
+    sample: List[Dict[str, Any]],
+    tokenizer,
+    use_template: bool = True,
+    model_name: Optional[str] = None,
+) -> Dict[str, List[int]]:
+    full_text = _build_text(tokenizer, sample, use_template=use_template)
+    prompt_text = _build_prompt_text(
+        tokenizer,
+        sample,
+        use_template=use_template,
+        model_name=model_name,
+    )
+    full_encoded = tokenizer(full_text, add_special_tokens=False)
+    prompt_encoded = tokenizer(prompt_text, add_special_tokens=False)
+    input_ids = list(full_encoded["input_ids"])
+    attention_mask = [1] * len(input_ids)
+    labels = list(input_ids)
+    prompt_len = min(len(prompt_encoded["input_ids"]), len(labels))
+    labels[:prompt_len] = [-100] * prompt_len
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
+class DPOPairDataset(Dataset):
+    def __init__(self, chosen_data, rejected_data, tokenizer, model_name: Optional[str] = None, use_template: bool = True):
+        if len(chosen_data) != len(rejected_data):
+            raise ValueError("chosen_data and rejected_data must have the same length.")
+        self.chosen_data = chosen_data
+        self.rejected_data = rejected_data
+        self.tokenizer = tokenizer
+        self.model_name = model_name
+        self.use_template = use_template
+
+    def __len__(self):
+        return len(self.chosen_data)
+
+    def __getitem__(self, idx):
+        chosen_feature = build_sft_feature(
+            self.chosen_data[idx],
+            self.tokenizer,
+            use_template=self.use_template,
+            model_name=self.model_name,
+        )
+        rejected_feature = build_sft_feature(
+            self.rejected_data[idx],
+            self.tokenizer,
+            use_template=self.use_template,
+            model_name=self.model_name,
+        )
+        return {
+            "chosen_input_ids": chosen_feature["input_ids"],
+            "chosen_attention_mask": chosen_feature["attention_mask"],
+            "chosen_labels": chosen_feature["labels"],
+            "rejected_input_ids": rejected_feature["input_ids"],
+            "rejected_attention_mask": rejected_feature["attention_mask"],
+            "rejected_labels": rejected_feature["labels"],
+        }
+
+
+@dataclass
+class DPODataCollatorWithPadding:
+    pad_token_id: int = 0
+    label_pad_token_id: int = -100
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        padded_batch = {}
+        for key in features[0].keys():
+            if key.endswith("_input_ids") or key.endswith("_attention_mask") or key.endswith("_labels"):
+                to_pad = [torch.tensor(feature[key], dtype=torch.long) for feature in features]
+                if key.endswith("_input_ids"):
+                    padding_value = self.pad_token_id
+                elif key.endswith("_attention_mask"):
+                    padding_value = 0
+                else:
+                    padding_value = self.label_pad_token_id
+                padded_batch[key] = pad_sequence(
+                    to_pad,
+                    batch_first=True,
+                    padding_value=padding_value,
+                )
+            elif key.endswith("_logps"):
+                padded_batch[key] = torch.tensor([feature[key] for feature in features])
+            else:
+                padded_batch[key] = [feature[key] for feature in features]
+        return padded_batch

@@ -1,6 +1,9 @@
 # a naive trainer using repnoise loss and beavertails dataset
+import copy
 import json
+import math
 import os
+import random
 
 import torch
 import torch.distributed as dist
@@ -102,6 +105,215 @@ def reduce_loss(loss):
     if isinstance(loss, torch.Tensor) and loss.ndim > 0:
         return loss.mean()
     return loss
+
+
+def log_p_loss_from_logits(logits, labels):
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    return loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    )
+
+
+def max_entropy_loss_from_logits(logits):
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum(dim=-1)
+    return -entropy.mean()
+
+
+def sequence_logps_from_logits(logits, labels):
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits and labels must have matching batch/sequence shapes.")
+
+    shifted_logits = logits[:, :-1, :]
+    shifted_labels = labels[:, 1:].clone()
+    loss_mask = shifted_labels != -100
+    shifted_labels = shifted_labels.masked_fill(~loss_mask, 0)
+    per_token_logps = torch.gather(
+        shifted_logits.log_softmax(-1),
+        dim=2,
+        index=shifted_labels.unsqueeze(2),
+    ).squeeze(2)
+    return (per_token_logps * loss_mask).sum(-1)
+
+
+def dpo_loss_from_logits(
+    policy_chosen_logits,
+    policy_chosen_labels,
+    policy_rejected_logits,
+    policy_rejected_labels,
+    reference_chosen_logps=None,
+    reference_rejected_logps=None,
+    beta=0.1,
+):
+    policy_chosen_logps = sequence_logps_from_logits(policy_chosen_logits, policy_chosen_labels)
+    policy_rejected_logps = sequence_logps_from_logits(policy_rejected_logits, policy_rejected_labels)
+    if reference_chosen_logps is None:
+        reference_chosen_logps = torch.zeros_like(policy_chosen_logps)
+    if reference_rejected_logps is None:
+        reference_rejected_logps = torch.zeros_like(policy_rejected_logps)
+
+    logits = (policy_chosen_logps - policy_rejected_logps) - (
+        reference_chosen_logps - reference_rejected_logps
+    )
+    losses = -torch.nn.functional.logsigmoid(beta * logits)
+    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
+    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
+    reward_acc = (chosen_rewards > rejected_rewards).float().mean()
+    return losses.mean(), reward_acc
+
+
+def _filter_dpo_inputs(inputs, chosen: bool = False):
+    prefix = "chosen_" if chosen else "rejected_"
+    if f"{prefix}input_ids" not in inputs:
+        return inputs
+    return {
+        "input_ids": inputs[f"{prefix}input_ids"],
+        "attention_mask": inputs[f"{prefix}attention_mask"],
+        "labels": inputs[f"{prefix}labels"],
+    }
+
+
+def _forward_inputs(inputs):
+    return {k: v for k, v in inputs.items() if k in ["input_ids", "attention_mask"]}
+
+
+def obj_standard_max_next_token(model, inputs, chosen: bool = False):
+    filtered_inputs = _filter_dpo_inputs(inputs, chosen=chosen)
+    outputs = model(**_forward_inputs(filtered_inputs), output_hidden_states=False)
+    return log_p_loss_from_logits(outputs.logits, filtered_inputs["labels"])
+
+
+def obj_model_mse_representations(model, inputs, base_model):
+    forward_inputs = _forward_inputs(inputs)
+    with torch.no_grad():
+        base_outputs = base_model(**forward_inputs, output_hidden_states=True)
+    model_outputs = model(**forward_inputs, output_hidden_states=True)
+    loss = log_p_loss_from_logits(model_outputs.logits, inputs["labels"])
+    rep_loss = torch.mean(
+        torch.stack(
+            [
+                torch.norm(base_hidden - model_hidden, dim=-1).mean()
+                for base_hidden, model_hidden in zip(
+                    base_outputs.hidden_states, model_outputs.hidden_states
+                )
+            ]
+        )
+    )
+    return loss + rep_loss
+
+
+def get_next_batch(iterator, dataloader):
+    try:
+        batch = next(iterator)
+    except StopIteration:
+        iterator = iter(dataloader)
+        batch = next(iterator)
+    return batch, iterator
+
+
+def next_n_batches(iterator, dataloader, n):
+    batches = []
+    for _ in range(n):
+        batch, iterator = get_next_batch(iterator, dataloader)
+        batches.append(batch)
+    return batches, iterator
+
+
+def distributed_sample_task(spec: str):
+    task_probs = {item.split(":")[0]: float(item.split(":")[1]) for item in spec.split(",")}
+    task_type = random.choices(list(task_probs.keys()), weights=list(task_probs.values()), k=1)[0]
+    if is_distributed():
+        payload = [task_type]
+        dist.broadcast_object_list(payload, src=0)
+        task_type = payload[0]
+    return task_type
+
+
+def distributed_sample_adversary_lr(adversary_lr_samples):
+    if isinstance(adversary_lr_samples, str):
+        adversary_lr_samples = [float(lr) for lr in adversary_lr_samples.split(",")]
+    idx = random.randrange(len(adversary_lr_samples))
+    if is_distributed():
+        tensor = torch.tensor([idx], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        dist.broadcast(tensor, src=0)
+        idx = int(tensor.item())
+    return adversary_lr_samples[idx]
+
+
+def schedule(i: int, K: int, schedule_lambda: float = 0.5):
+    return torch.exp(schedule_lambda * (torch.tensor(i) - (K - 1))).item()
+
+
+def sample_switching_point(switching_point_coeffs: str, tar_inner_loop_steps: int):
+    coeffs = {
+        key: float(value)
+        for key, value in (item.split(":") for item in switching_point_coeffs.split(","))
+    }
+    point = int(
+        torch.distributions.Beta(coeffs["alpha"], coeffs["beta"]).sample()
+        * tar_inner_loop_steps
+    )
+    if is_distributed():
+        payload = [point]
+        dist.broadcast_object_list(payload, src=0)
+        point = payload[0]
+    return point
+
+
+class ModelStorage:
+    def __init__(self):
+        self.storage_dict = {"params": {}, "grads": {}}
+
+    def clear_params(self):
+        self.storage_dict["params"].clear()
+
+    def clear_grads(self):
+        self.storage_dict["grads"].clear()
+
+    def collect_param_or_grad(self, model, to_cpu: bool = False, mode: str = "grads", scale: float = 1.0):
+        for idx, param in enumerate(model.parameters()):
+            if not param.requires_grad:
+                continue
+            if mode == "params":
+                tensor = param.detach().clone()
+                self.storage_dict["params"][idx] = tensor.cpu() if to_cpu else tensor
+            elif mode == "grads" and param.grad is not None:
+                grad = param.grad.detach().clone() * scale
+                if idx not in self.storage_dict["grads"]:
+                    self.storage_dict["grads"][idx] = grad.cpu() if to_cpu else grad
+                else:
+                    existing = self.storage_dict["grads"][idx]
+                    if existing.device != grad.device:
+                        existing = existing.to(grad.device)
+                    existing = existing + grad
+                    self.storage_dict["grads"][idx] = existing.cpu() if to_cpu else existing
+
+    def add_from_storage_to_model(self, model, skip_check: bool = False, mode: str = "grads"):
+        for idx, param in enumerate(model.parameters()):
+            if not param.requires_grad:
+                continue
+            if mode == "params":
+                if idx in self.storage_dict["params"]:
+                    param.data.copy_(self.storage_dict["params"][idx].to(param.device))
+                continue
+            if not skip_check:
+                assert (idx in self.storage_dict["grads"]) == (param.grad is not None)
+            if idx in self.storage_dict["grads"] and param.grad is not None:
+                param.grad += self.storage_dict["grads"][idx].to(param.device)
+
+
+def move_batch_to_device(batch, device):
+    moved = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
 
 class SFTTrainer:
     def __init__(
@@ -2517,211 +2729,373 @@ class LISATrainer(SAMTrainer):
         return
 
 
-class TARTrainer(BoosterTrainer):
+class TARTrainer:
     def __init__(
         self,
         model,
         model_name,
         tokenizer,
-        harmful_dataloader=None,
-        harmless_dataloader=None,
-        lr=1e-5,
+        dataloaders,
+        ref_model=None,
+        retain_model=None,
+        lr=2e-5,
         num_training_steps=None,
         epochs=None,
         grad_accum=1,
         max_grad_norm=1.0,
         device=None,
-        log_steps=20,
+        log_steps=1,
         out_dir=None,
         save_steps=None,
-        alpha=0.8,
-        rho=0.05,
-        inner_steps=5,
         save_epochs=None,
+        tar_inner_loop_steps=4,
+        tar_tamper_resistance_loss_lower_bound=-11.76,
+        tar_tamper_resistance_grad_scale=4.0,
+        tar_tamper_resistance_loss_type="max_entropy",
+        schedule_lambda=0.5,
+        inner_optimizer_warmup_steps=20,
+        unbounded=False,
+        use_weighting_schedule=False,
+        adversary_dist_types="forget_train:1.0",
+        adversary_lr_schedulers="constant:1.0",
+        tar_num_tasks_sampled=1,
+        adversary_lr_samples="2e-5,4e-5,1e-4",
+        tar_inner_loop_subsample=1,
+        tar_retain_scale=1.0,
+        retain_representations=False,
+        switching_point_coeffs="alpha:6.0,beta:3.0",
+        dpo_beta=0.1,
     ):
-        super().__init__(
-            model=model,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            harmful_dataloader=harmful_dataloader,
-            harmless_dataloader=harmless_dataloader,
-            lr=lr,
-            num_training_steps=num_training_steps,
-            epochs=epochs,
-            grad_accum=grad_accum,
-            max_grad_norm=max_grad_norm,
-            device=device,
-            log_steps=log_steps,
-            out_dir=out_dir,
-            save_steps=save_steps,
-            rho=rho,
-            alpha=alpha,
-        )
-        self.inner_steps = max(1, int(inner_steps))
+        self.model = model
+        self.model_name = model_name
+        self.tokenizer = tokenizer
+        self.dataloaders = dataloaders
+        self.retain_dataloader = dataloaders["retain"]
+        self.meta_dataloader = dataloaders["meta"]
+        self.adversary_dataloaders = {k: v for k, v in dataloaders.items() if k not in ["retain", "meta"]}
+        self.lr = lr
+        self.grad_accum = grad_accum
+        self.max_grad_norm = max_grad_norm
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.log_steps = log_steps
+        self.out_dir = out_dir or "./tar_checkpoints"
+        self.save_steps = save_steps
         self.save_epochs = save_epochs
+        self.tar_inner_loop_steps = tar_inner_loop_steps
+        self.tar_tamper_resistance_loss_lower_bound = tar_tamper_resistance_loss_lower_bound
+        self.tar_tamper_resistance_grad_scale = tar_tamper_resistance_grad_scale
+        self.tar_tamper_resistance_loss_type = tar_tamper_resistance_loss_type
+        self.schedule_lambda = schedule_lambda
+        self.inner_optimizer_warmup_steps = inner_optimizer_warmup_steps
+        self.unbounded = unbounded
+        self.use_weighting_schedule = use_weighting_schedule
+        self.adversary_dist_types = adversary_dist_types
+        self.adversary_lr_schedulers = adversary_lr_schedulers
+        self.tar_num_tasks_sampled = tar_num_tasks_sampled
+        self.adversary_lr_samples = adversary_lr_samples
+        self.tar_inner_loop_subsample = tar_inner_loop_subsample
+        self.tar_retain_scale = tar_retain_scale
+        self.retain_representations = retain_representations
+        self.switching_point_coeffs = switching_point_coeffs
+        self.dpo_beta = dpo_beta
 
-        total_batches = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
+        self.raw_model = unwrap_model(self.model)
+        if not is_fsdp_model(self.model):
+            self.raw_model.to(self.device)
+        self.model.train()
+        self.opt_model = get_optimizer_model(self.model, self.raw_model)
+        self.opt = AdamW(self.opt_model.parameters(), lr=self.lr)
+        self.global_step = 0
+
+        self.epochs = epochs
         if num_training_steps is None:
-            self.num_training_steps = self.epochs * total_batches // self.grad_accum
-        self.lr_scheduler = get_scheduler(
-            "constant",
-            optimizer=self.opt,
-        )
+            if self.epochs is None:
+                raise ValueError("Specify either num_training_steps or epochs for TARTrainer.")
+            steps_per_epoch = max(1, len(self.retain_dataloader) // max(1, self.grad_accum))
+            self.num_training_steps = self.epochs * steps_per_epoch
+        else:
+            self.num_training_steps = num_training_steps
+
+        self.ref_model = ref_model
+        if self.tar_tamper_resistance_loss_type == "dpo":
+            if self.ref_model is None:
+                self.ref_model = copy.deepcopy(self.raw_model)
+            self.ref_model.to(self.device)
+            self.ref_model.eval()
+
+        self.retain_model = retain_model
+        if self.retain_representations:
+            if self.retain_model is None:
+                self.retain_model = copy.deepcopy(self.raw_model)
+            self.retain_model.to(self.device)
+            self.retain_model.eval()
 
         if wandb is not None and wandb.run is not None:
-            safe_bs = getattr(self.safe_dataloader, "batch_size", None)
-            unsafe_bs = getattr(self.unsafe_dataloader, "batch_size", None)
             wandb.config.update(
                 {
                     "lr": self.lr,
-                    "epochs": self.epochs,
                     "num_training_steps": self.num_training_steps,
-                    "alpha": self.alpha,
-                    "rho": self.rho,
-                    "inner_steps": self.inner_steps,
-                    "safe_batch_size": safe_bs,
-                    "unsafe_batch_size": unsafe_bs,
+                    "tar_inner_loop_steps": self.tar_inner_loop_steps,
+                    "tar_tamper_resistance_grad_scale": self.tar_tamper_resistance_grad_scale,
+                    "tar_tamper_resistance_loss_type": self.tar_tamper_resistance_loss_type,
+                    "tar_retain_scale": self.tar_retain_scale,
+                    "adversary_dist_types": self.adversary_dist_types,
+                    "adversary_lr_schedulers": self.adversary_lr_schedulers,
+                    "adversary_lr_samples": self.adversary_lr_samples,
+                    "tar_num_tasks_sampled": self.tar_num_tasks_sampled,
+                    "tar_inner_loop_subsample": self.tar_inner_loop_subsample,
+                    "dpo_beta": self.dpo_beta,
                 }
             )
 
-    def _build_param_and_buffer_dict(self):
-        param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
-        param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
-        return param_and_buffer_dict
+    def save(self, name):
+        save_path = os.path.join(self.out_dir, name)
+        save_model_and_tokenizer(self.model, self.raw_model, self.tokenizer, save_path)
 
-    def _run_attack_trajectory(self, unsafe_batch, safe_batch):
-        trainable_named_params = [
-            (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
-        ]
-        param_and_buffer_dict = self._build_param_and_buffer_dict()
-
-        attacked_safe_losses = []
-        harmful_losses = []
-
-        for _ in range(self.inner_steps):
-            current_params = [param_and_buffer_dict[name] for name, _ in trainable_named_params]
-            harmful_loss = reduce_loss(
-                _functional_call(self.stateless_model, param_and_buffer_dict, (), unsafe_batch).loss
-            )
-            harmful_losses.append(harmful_loss.detach())
-
-            grads = torch.autograd.grad(
-                harmful_loss,
-                current_params,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=True,
-            )
-
-            attacked_safe_loss = reduce_loss(
-                _functional_call(self.stateless_model, param_and_buffer_dict, (), safe_batch).loss
-            )
-            attacked_safe_losses.append(attacked_safe_loss)
-
-            with torch.no_grad():
-                global_norm_sq = None
-                for g in grads:
-                    if g is None:
-                        continue
-                    g2 = (g.detach().float() ** 2).sum()
-                    global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
-
-                if global_norm_sq is None:
-                    scale = None
+    def tamper_resistance_obj(self, batches, scale: float):
+        total_loss = 0.0
+        total_diag = 0.0
+        diag_name = "next_token"
+        for i in range(self.grad_accum):
+            batch = move_batch_to_device(batches[i], self.device)
+            if self.tar_tamper_resistance_loss_type == "max_entropy":
+                outputs = self.model(**_forward_inputs(batch), output_hidden_states=False)
+                loss = max_entropy_loss_from_logits(outputs.logits) * scale
+                diag = log_p_loss_from_logits(outputs.logits, batch["labels"]).item() / self.grad_accum
+                (loss / self.grad_accum).backward()
+                total_loss += (loss / self.grad_accum).item()
+                total_diag += diag
+            else:
+                diag_name = "reward_accs"
+                chosen_batch = _filter_dpo_inputs(batch, chosen=True)
+                rejected_batch = _filter_dpo_inputs(batch, chosen=False)
+                policy_chosen_logits = self.model(**_forward_inputs(chosen_batch), output_hidden_states=False).logits
+                policy_rejected_logits = self.model(**_forward_inputs(rejected_batch), output_hidden_states=False).logits
+                reference_chosen_logps = batch.get("reference_chosen_logps")
+                reference_rejected_logps = batch.get("reference_rejected_logps")
+                if reference_chosen_logps is not None:
+                    reference_chosen_logps = reference_chosen_logps.to(self.device)
+                    reference_rejected_logps = reference_rejected_logps.to(self.device)
                 else:
-                    global_norm = torch.sqrt(global_norm_sq)
-                    scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
+                    with torch.no_grad():
+                        ref_chosen_logits = self.ref_model(**_forward_inputs(chosen_batch), output_hidden_states=False).logits
+                        ref_rejected_logits = self.ref_model(**_forward_inputs(rejected_batch), output_hidden_states=False).logits
+                        reference_chosen_logps = sequence_logps_from_logits(ref_chosen_logits, chosen_batch["labels"])
+                        reference_rejected_logps = sequence_logps_from_logits(ref_rejected_logits, rejected_batch["labels"])
+                loss, reward_acc = dpo_loss_from_logits(
+                    policy_chosen_logits,
+                    chosen_batch["labels"],
+                    policy_rejected_logits,
+                    rejected_batch["labels"],
+                    reference_chosen_logps=reference_chosen_logps,
+                    reference_rejected_logps=reference_rejected_logps,
+                    beta=self.dpo_beta,
+                )
+                scaled_loss = loss * scale / self.grad_accum
+                scaled_loss.backward()
+                total_loss += scaled_loss.item()
+                total_diag += reward_acc.item() / self.grad_accum
+        if wandb is not None and wandb.run is not None and is_main_process():
+            wandb.log(
+                {
+                    f"tr_{self.tar_tamper_resistance_loss_type}_loss": total_loss / max(scale, 1e-12),
+                    f"tr_{diag_name}_loss": total_diag,
+                },
+                step=self.global_step,
+            )
+        return total_loss
 
-            if scale is None:
-                continue
+    def adversary_next_token_obj_step(self, adversary_batches, sub_pbar=None):
+        total_loss = 0.0
+        for i in range(self.grad_accum):
+            batch = move_batch_to_device(adversary_batches[i], self.device)
+            loss = obj_standard_max_next_token(self.model, batch) / self.grad_accum
+            loss.backward()
+            total_loss += loss.item()
+        if sub_pbar is not None:
+            sub_pbar.update(1)
+            sub_pbar.set_postfix({"inner loss": total_loss})
+        if wandb is not None and wandb.run is not None and is_main_process():
+            wandb.log({"inner_next_token_loss": total_loss}, step=self.global_step)
+        return total_loss
 
-            for (name, _), g in zip(trainable_named_params, grads):
-                if g is None:
-                    continue
-                current = param_and_buffer_dict[name]
-                perturb = g.detach().to(dtype=current.dtype) * scale
-                param_and_buffer_dict[name] = current - perturb
+    def inner_loop_step(
+        self,
+        adversary_batches,
+        meta_forget_batches,
+        inner_optimizer,
+        inner_scheduler,
+        model_storage,
+        sub_pbar,
+        meta_grad_scale,
+        compute_tamper_resistance_grad,
+    ):
+        self.adversary_next_token_obj_step(adversary_batches, sub_pbar=sub_pbar)
+        inner_optimizer.step()
+        if inner_scheduler is not None:
+            inner_scheduler.step()
+        self.model.zero_grad(set_to_none=True)
 
-        if attacked_safe_losses:
-            attacked_safe_loss_mean = torch.stack(attacked_safe_losses).mean()
-        else:
-            attacked_safe_loss_mean = torch.tensor(0.0, device=self.device)
-
-        return {
-            "attacked_safe_loss_mean": attacked_safe_loss_mean,
-            "attacked_safe_loss_first": attacked_safe_losses[0].detach() if attacked_safe_losses else torch.tensor(0.0, device=self.device),
-            "attacked_safe_loss_last": attacked_safe_losses[-1].detach() if attacked_safe_losses else torch.tensor(0.0, device=self.device),
-            "harmful_loss_first": harmful_losses[0] if harmful_losses else torch.tensor(0.0, device=self.device),
-            "harmful_loss_last": harmful_losses[-1] if harmful_losses else torch.tensor(0.0, device=self.device),
-        }
+        tamper_resistance_loss = 0.0
+        if compute_tamper_resistance_grad:
+            tamper_resistance_loss = self.tamper_resistance_obj(
+                meta_forget_batches,
+                scale=meta_grad_scale,
+            )
+            model_storage.collect_param_or_grad(self.model, to_cpu=False, mode="grads")
+            self.model.zero_grad(set_to_none=False)
+        return tamper_resistance_loss
 
     def train(self):
         os.makedirs(self.out_dir, exist_ok=True)
+        retain_iterator = iter(self.retain_dataloader)
+        meta_iterator = iter(self.meta_dataloader)
+        adversary_iterators = {
+            key: {"iter": iter(value), "dataloader": value}
+            for key, value in self.adversary_dataloaders.items()
+        }
 
-        for epoch in range(self.epochs):
-            set_dataloader_epoch(self.unsafe_dataloader, epoch)
-            set_dataloader_epoch(self.safe_dataloader, epoch)
-            total_steps = min(len(self.unsafe_dataloader), len(self.safe_dataloader))
-            epoch_iter = zip(self.unsafe_dataloader, self.safe_dataloader)
-            pbar = tqdm(epoch_iter, total=total_steps, desc=f"Epoch {epoch+1}", disable=not is_main_process())
-            for step, (unsafe_batch, safe_batch) in enumerate(pbar):
-                unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
-                safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
+        storage = ModelStorage()
 
-                attack_stats = self._run_attack_trajectory(unsafe_batch, safe_batch)
-                safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
-                attacked_safe_loss = attack_stats["attacked_safe_loss_mean"]
+        if is_fsdp_model(self.model):
+            init_batch, retain_iterator = get_next_batch(retain_iterator, self.retain_dataloader)
+            init_batch = move_batch_to_device(init_batch, self.device)
+            obj_standard_max_next_token(self.model, init_batch).backward()
+            self.model.zero_grad(set_to_none=False)
 
-                loss = (1 - self.alpha) * safe_loss_raw + self.alpha * attacked_safe_loss
-                loss = loss / self.grad_accum
-                loss.backward()
+        pbar = tqdm(
+            colour="blue",
+            desc="Outer Training Loop",
+            total=self.num_training_steps,
+            dynamic_ncols=True,
+            disable=not is_main_process(),
+        )
 
-                pbar.set_postfix(
-                    loss=f"{loss.item() * self.grad_accum:.4f}",
-                    sloss=f"{safe_loss_raw.item():.4f}",
-                    atk_safe=f"{attacked_safe_loss.detach().item():.4f}",
-                    harm0=f"{attack_stats['harmful_loss_first'].item():.4f}",
-                    harmk=f"{attack_stats['harmful_loss_last'].item():.4f}",
+        for _ in range(self.num_training_steps):
+            tamper_resistance_loss = 0.0
+            storage.collect_param_or_grad(self.model, to_cpu=True, mode="params")
+
+            for _task_idx in range(self.tar_num_tasks_sampled):
+                adversary_type = distributed_sample_task(self.adversary_dist_types)
+                sub_pbar = None
+                if is_main_process():
+                    sub_pbar = tqdm(
+                        colour="blue",
+                        desc=f"Inner Training Loop ({adversary_type})",
+                        total=self.tar_inner_loop_steps,
+                        dynamic_ncols=True,
+                        leave=False,
+                    )
+
+                meta_forget_batches, meta_iterator = next_n_batches(
+                    meta_iterator,
+                    self.meta_dataloader,
+                    self.grad_accum,
                 )
-                
-                if (step + 1) % self.grad_accum == 0:
-                    clip_grad_norm(self.model, self.max_grad_norm)
-                    self.opt.step()
-                    self.lr_scheduler.step()
-                    self.opt.zero_grad()
-                    self.global_step += 1
 
-                    if is_main_process():
-                        tqdm.write(
-                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, "
-                            f"Safe: {safe_loss_raw.item():.4f}, AttackedSafe: {attacked_safe_loss.detach().item():.4f}, "
-                            f"HarmfulFirst: {attack_stats['harmful_loss_first'].item():.4f}, HarmfulLast: {attack_stats['harmful_loss_last'].item():.4f}"
-                        )
-                    if wandb is not None and wandb.run is not None:
-                        wandb.log(
-                            {
-                            "loss/total": loss.item() * self.grad_accum,
-                            "loss/safe": safe_loss_raw.item(),
-                            "loss/attacked_safe": attacked_safe_loss.detach().item(),
-                            "loss/attacked_safe_first": attack_stats["attacked_safe_loss_first"].item(),
-                            "loss/attacked_safe_last": attack_stats["attacked_safe_loss_last"].item(),
-                            "loss/harmful_first": attack_stats["harmful_loss_first"].item(),
-                            "loss/harmful_last": attack_stats["harmful_loss_last"].item(),
-                            },
-                            step=self.global_step,
-                        )
+                adversary_lr = distributed_sample_adversary_lr(self.adversary_lr_samples)
+                inner_optimizer = torch.optim.AdamW(self.model.parameters(), lr=adversary_lr)
+                inner_scheduler = None
+                adversary_lr_scheduler = distributed_sample_task(self.adversary_lr_schedulers)
+                if adversary_lr_scheduler == "linear_warmup":
+                    inner_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        inner_optimizer,
+                        lambda step: self.tar_inner_loop_steps / self.inner_optimizer_warmup_steps,
+                    )
 
-                    if self.save_steps is not None and self.global_step % self.save_steps == 0:
-                        self.save(f"checkpoint-step-{self.global_step}")
-                    
-                    if self.global_step >= self.num_training_steps:
-                        # Save final model
-                        self.save("final-model")
-                        return
-            
-            # End of epoch
-            if self.save_epochs is not None and (epoch + 1) % self.save_epochs == 0:
-                self.save(f"checkpoint-epoch-{epoch+1}")
+                switching_point = None
+                if adversary_type == "retain_forget_switch":
+                    switching_point = sample_switching_point(
+                        self.switching_point_coeffs,
+                        self.tar_inner_loop_steps,
+                    )
+
+                for inner_step in range(self.tar_inner_loop_steps):
+                    current_adversary_type = adversary_type
+                    if adversary_type == "retain_forget_switch":
+                        current_adversary_type = "adv_retain" if inner_step < switching_point else "forget_train"
+
+                    adversary_batches, adversary_iterators[current_adversary_type]["iter"] = next_n_batches(
+                        adversary_iterators[current_adversary_type]["iter"],
+                        adversary_iterators[current_adversary_type]["dataloader"],
+                        self.grad_accum,
+                    )
+
+                    scheduled_weighting = (
+                        schedule(inner_step, self.tar_inner_loop_steps, self.schedule_lambda)
+                        if self.use_weighting_schedule
+                        else 1 / self.tar_inner_loop_steps
+                    )
+                    compute_tr_grad = (inner_step + 1) % self.tar_inner_loop_subsample == 0
+                    tamper_resistance_loss += self.inner_loop_step(
+                        adversary_batches=adversary_batches,
+                        meta_forget_batches=meta_forget_batches,
+                        inner_optimizer=inner_optimizer,
+                        inner_scheduler=inner_scheduler,
+                        model_storage=storage,
+                        sub_pbar=sub_pbar,
+                        meta_grad_scale=(
+                            self.tar_tamper_resistance_grad_scale
+                            * scheduled_weighting
+                            / self.tar_num_tasks_sampled
+                        ),
+                        compute_tamper_resistance_grad=compute_tr_grad,
+                    )
+
+                storage.add_from_storage_to_model(self.model, skip_check=True, mode="params")
+
+            outer_retain_batches, retain_iterator = next_n_batches(
+                retain_iterator,
+                self.retain_dataloader,
+                self.grad_accum,
+            )
+            total_retain_loss = 0.0
+            for i in range(self.grad_accum):
+                retain_batch = move_batch_to_device(outer_retain_batches[i], self.device)
+                if self.retain_representations:
+                    retain_loss = obj_model_mse_representations(
+                        self.model,
+                        retain_batch,
+                        self.retain_model,
+                    )
+                else:
+                    retain_loss = obj_standard_max_next_token(self.model, retain_batch)
+                retain_loss = retain_loss / self.grad_accum * self.tar_retain_scale
+                retain_loss.backward()
+                total_retain_loss += retain_loss.item()
+
+            if tamper_resistance_loss >= self.tar_tamper_resistance_loss_lower_bound or self.unbounded:
+                storage.add_from_storage_to_model(self.model, mode="grads")
+
+            storage.clear_grads()
+            storage.clear_params()
+
+            clip_grad_norm(self.model, self.max_grad_norm)
+            self.opt.step()
+            self.model.zero_grad(set_to_none=True)
+            self.global_step += 1
+
+            if is_main_process():
+                pbar.update(1)
+                pbar.set_postfix(
+                    {
+                        "retain / tr": f"{total_retain_loss:.4f} / {tamper_resistance_loss:.4f}",
+                    }
+                )
+            if wandb is not None and wandb.run is not None:
+                wandb.log(
+                    {
+                        "retain_loss": total_retain_loss,
+                        "tamper_resistance_loss": tamper_resistance_loss,
+                        "learning_rate": self.opt.param_groups[0]["lr"],
+                    },
+                    step=self.global_step,
+                )
+
+            if self.save_steps is not None and self.global_step % self.save_steps == 0:
+                self.save(f"checkpoint-step-{self.global_step}")
+
+        pbar.close()
         self.save("final-model")
         return
 

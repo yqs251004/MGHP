@@ -68,7 +68,7 @@ def maybe_wrap_ddp(model, device: torch.device):
     )
 
 
-def build_fsdp_model(model, device: torch.device):
+def build_fsdp_model(model, device: torch.device, use_orig_params: bool = True):
     if FSDP is None or not is_distributed():
         return model.to(device)
 
@@ -90,7 +90,7 @@ def build_fsdp_model(model, device: torch.device):
         auto_wrap_policy=auto_wrap_policy,
         device_id=device,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        use_orig_params=True,
+        use_orig_params=use_orig_params,
     )
 
 
