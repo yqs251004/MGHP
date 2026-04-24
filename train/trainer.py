@@ -2376,70 +2376,83 @@ class HarmfulBoosterTrainer(SAMTrainer):
                 unsafe_batch = {k: v.to(self.device) for k, v in unsafe_batch.items()}
                 safe_batch = {k: v.to(self.device) for k, v in safe_batch.items()}
 
-                # --- SAM-style perturbation direction from unsafe loss (no inplace param edits) ---
+                # --- SAM-style perturbation direction from unsafe loss ---
+                self.opt.zero_grad(set_to_none=True)
                 unsafe_loss_for_grad = reduce_loss(self.model(**unsafe_batch).loss)
-                trainable_named_params = [
-                    (name, p) for name, p in self.stateless_model.named_parameters() if p.requires_grad
-                ]
-                params = [p for _, p in trainable_named_params]
-                grads = torch.autograd.grad(
-                    unsafe_loss_for_grad,
-                    params,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
+                unsafe_loss_for_grad.backward()
+
+                trainable_named_params = []
+                grads = []
+                for param_source in (self.stateless_model, self.opt_model):
+                    candidate_named_params = [
+                        (name, p) for name, p in param_source.named_parameters() if p.requires_grad
+                    ]
+                    candidate_grads = [
+                        p.grad.detach().clone() if p.grad is not None else None
+                        for _, p in candidate_named_params
+                    ]
+                    if any(g is not None for g in candidate_grads):
+                        trainable_named_params = candidate_named_params
+                        grads = candidate_grads
+                        break
+                self.opt.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
-                    global_norm_sq = None
+                    global_norm_sq = torch.zeros((), device=self.device)
+                    grad_count = torch.zeros((), device=self.device)
                     for g in grads:
                         if g is None:
                             continue
-                        g2 = (g.detach().float() ** 2).sum()
-                        global_norm_sq = g2 if global_norm_sq is None else (global_norm_sq + g2)
-                    if global_norm_sq is None:
-                        scale = None
-                    else:
-                        global_norm = torch.sqrt(global_norm_sq)
-                        scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
-                        # scale = self.rho
+                        global_norm_sq += (g.detach().float() ** 2).sum()
+                        grad_count += 1
+                    if is_distributed():
+                        dist.all_reduce(global_norm_sq, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(grad_count, op=dist.ReduceOp.SUM)
+                    if grad_count.item() == 0:
+                        raise RuntimeError("HarmfulBooster did not receive gradients for any trainable parameter.")
+                    global_norm = torch.sqrt(global_norm_sq)
+                    scale = self.rho / (global_norm + 1e-12) if global_norm.item() != 0.0 else None
+                    # scale = self.rho
 
-                # Compute perturbed unsafe loss using functional_call to avoid inplace modifications
-                param_and_buffer_dict = {name: p for name, p in self.stateless_model.named_parameters()}
-                param_and_buffer_dict.update({name: b for name, b in self.stateless_model.named_buffers()})
-                if scale is not None:
-                    for (name, p), g in zip(trainable_named_params, grads):
-                        if g is None:
-                            continue
-                        perturb = g.detach().to(dtype=p.dtype) * scale
-                        param_and_buffer_dict[name] = p - perturb
-                # unsafe_loss_perturbed = _functional_call(self.model, param_and_buffer_dict, (), unsafe_batch).loss
-                unsafe_loss_perturbed = reduce_loss(
-                    _functional_call(self.stateless_model, param_and_buffer_dict, (), unsafe_batch).loss
-                )
-                # test: use weighted loss for each token
-                # unsafe_logits_perturbed = _functional_call(self.model, param_and_buffer_dict, (), safe_batch).logits
-                # unsafe_loss_perturbed = weighted_ce_loss(unsafe_logits_perturbed, safe_batch["labels"])
-
-                # Losses at the original parameters (safe for backward)
                 safe_loss_raw = reduce_loss(self.model(**safe_batch).loss)
-                # safe_loss_raw = weighted_ce_loss(self.model(**safe_batch).logits, safe_batch["labels"])
                 unsafe_loss_raw = reduce_loss(self.model(**unsafe_batch).loss)
+                original_loss = safe_loss_raw + self.alpha * unsafe_loss_raw
+                (original_loss / self.grad_accum).backward()
 
-                # IMPORTANT: only backprop through graphs built with current (unmodified) parameters
-                # loss = safe_loss_raw - torch.log(
-                #     (1 - self.alpha) * unsafe_loss_raw + self.alpha * unsafe_loss_perturbed
-                # )
-                loss = safe_loss_raw + self.alpha * (unsafe_loss_raw - unsafe_loss_perturbed)
-                # loss = (1 - self.alpha) * safe_loss_raw + self.alpha * unsafe_loss_perturbed
-                loss = loss / self.grad_accum
-                loss.backward()
+                perturbations = []
+                with torch.no_grad():
+                    if scale is not None:
+                        for (_, p), g in zip(trainable_named_params, grads):
+                            if g is None:
+                                continue
+                            perturb = -g.detach().to(dtype=p.dtype) * scale.to(dtype=p.dtype)
+                            p.add_(perturb)
+                            perturbations.append((p, perturb))
+                    perturb_count = len(perturbations)
+                try:
+                    unsafe_loss_perturbed = reduce_loss(self.model(**unsafe_batch).loss)
+                    loss = safe_loss_raw.detach() + self.alpha * (
+                        unsafe_loss_raw.detach() - unsafe_loss_perturbed.detach()
+                    )
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError(
+                            f"HarmfulBooster produced a non-finite loss at step {self.global_step + 1}: "
+                            f"safe={safe_loss_raw.detach().item()}, "
+                            f"unsafe={unsafe_loss_raw.detach().item()}, "
+                            f"perturbed_unsafe={unsafe_loss_perturbed.detach().item()}, "
+                            f"total={loss.detach().item()}"
+                        )
+                    (-self.alpha * unsafe_loss_perturbed / self.grad_accum).backward()
+                finally:
+                    with torch.no_grad():
+                        for p, perturb in perturbations:
+                            p.sub_(perturb)
                 
                 pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    sloss=f"{safe_loss_raw.item():.4f}",
-                    hloss=f"{unsafe_loss_raw.item():.4f}",
-                    ploss=f"{unsafe_loss_perturbed.item():.4f}",
+                    loss=f"{loss.item():.6f}",
+                    sloss=f"{safe_loss_raw.item():.6f}",
+                    hloss=f"{unsafe_loss_raw.item():.6f}",
+                    ploss=f"{unsafe_loss_perturbed.item():.6f}",
                 )
                 
                 if (step + 1) % self.grad_accum == 0:
@@ -2452,7 +2465,13 @@ class HarmfulBoosterTrainer(SAMTrainer):
                     # if self.global_step % self.log_steps == 0:
                     if is_main_process():
                         tqdm.write(
-                            f"Epoch {epoch+1}, Step {self.global_step}, Loss: {loss.item() * self.grad_accum:.4f}, Safe: {safe_loss_raw.item():.4f}, Unsafe: {unsafe_loss_raw.item():.4f}, PerturbedUnsafe: {unsafe_loss_perturbed.item():.4f}"
+                            f"Epoch {epoch+1}, Step {self.global_step}, "
+                            f"Loss: {loss.item() * self.grad_accum:.8f}, "
+                            f"Safe: {safe_loss_raw.item():.8f}, "
+                            f"Unsafe: {unsafe_loss_raw.item():.8f}, "
+                            f"PerturbedUnsafe: {unsafe_loss_perturbed.item():.8f}, "
+                            f"GradNorm: {global_norm.item():.8f}, "
+                            f"PerturbedParams: {perturb_count}"
                         )
                     if wandb is not None and wandb.run is not None:
                         wandb.log(
@@ -2461,6 +2480,8 @@ class HarmfulBoosterTrainer(SAMTrainer):
                                 "loss/safe": safe_loss_raw.item(),
                                 "loss/unsafe": unsafe_loss_raw.item(),
                                 "loss/perturbed_unsafe": unsafe_loss_perturbed.item(),
+                                "diagnostics/grad_norm": global_norm.item(),
+                                "diagnostics/perturbed_params": perturb_count,
                             },
                             step=self.global_step,
                         )
@@ -2557,7 +2578,8 @@ class LISATrainer(SAMTrainer):
                     "cycles_per_epoch": self.cycles_per_epoch,
                     "safe_batch_size": safe_bs,
                     "unsafe_batch_size": unsafe_bs,
-                }
+                },
+                allow_val_change=True,
             )
 
     def _compute_cycles_per_epoch(self):
@@ -2617,6 +2639,12 @@ class LISATrainer(SAMTrainer):
             ce_loss = reduce_loss(self.model(**batch).loss)
             prox_loss = self._compute_prox_loss(reference_weights)
             total_loss = ce_loss + prox_loss.to(dtype=ce_loss.dtype)
+            if not torch.isfinite(total_loss):
+                raise FloatingPointError(
+                    f"LISA produced a non-finite loss at step {self.global_step + 1} "
+                    f"during {state_name}: ce={ce_loss.detach().item()}, "
+                    f"prox={prox_loss.detach().item()}, total={total_loss.detach().item()}"
+                )
 
             (total_loss / self.grad_accum).backward()
 
