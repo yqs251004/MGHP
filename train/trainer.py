@@ -432,7 +432,7 @@ class SFTTrainer:
 
                 if (step + 1) % self.grad_accum == 0:
                     # get the grad norm
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm = clip_grad_norm(self.model, self.max_grad_norm)
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
